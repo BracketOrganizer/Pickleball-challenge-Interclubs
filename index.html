@@ -9,17 +9,16 @@
     <meta name="theme-color" content="#f0f4fa">
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
-        import { getFirestore, doc, setDoc, getDoc, onSnapshot, collection, getDocs, deleteDoc } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
+        import { getFirestore, doc, setDoc, getDoc, updateDoc, addDoc, query, where, serverTimestamp, onSnapshot, collection, getDocs, deleteDoc } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
         import { getAuth, GoogleAuthProvider, signInWithPopup, signInWithEmailAndPassword, createUserWithEmailAndPassword, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
 
         const firebaseConfig = {
-            apiKey: "AIzaSyCuOP-EwHzOo1p-WeNu0gQbWyv97kA6T5M",
-            authDomain: "pickleball-clean.firebaseapp.com",
-            databaseURL: "https://pickleball-clean-default-rtdb.europe-west1.firebasedatabase.app",
-            projectId: "pickleball-clean",
-            storageBucket: "pickleball-clean.firebasestorage.app",
-            messagingSenderId: "1095429902544",
-            appId: "1:1095429902544:web:dc4aa9070a0d654f480ed5"
+            apiKey: "AIzaSyAvppGIS7M12LFgaPEuFdo-ed6rrAtgcSc",
+            authDomain: "tournoi-de-pickleball-flexible.firebaseapp.com",
+            projectId: "tournoi-de-pickleball-flexible",
+            storageBucket: "tournoi-de-pickleball-flexible.firebasestorage.app",
+            messagingSenderId: "64638196209",
+            appId: "1:64638196209:web:d34bef9f23a82c730fcc50"
         };
 
         const app = initializeApp(firebaseConfig);
@@ -43,6 +42,10 @@
         let timeSettings = { startP1:'09:00', durationP1:30, breakP1:5, lunchStart:'12:30', lunchDuration:90, durationP2:30, breakP2:5 };
         let isAdmin = false;
         let isSaisie = false;
+        let USER_ROLES = [];                 // rôles du compte connecté (collection users, comme l'appli RSTH)
+        let CLUB_PROFILE = null, CLUB_TEAMS = [], CLUB_EDIT_ID = null;
+        // même liste que les règles Firestore : ces comptes sont admin même sans document users
+        const RULE_ADMIN_EMAILS = ["checheux@gmail.com","bracket.organizer@gmail.com"];
         let currentUser = null;
         let saveTimeout = null;
         let secondaryApp = null;
@@ -92,6 +95,19 @@
         // Nombre total de terrains
         function getTotalTerrains() {
             return terrainsParSalle.reduce((a,b)=>a+b,0);
+        }
+
+        // Répartition proportionnelle aux terrains : chaque poule va dans la salle qui reste la moins chargée
+        // (poules de P1 en alternance ; avec 8+8 terrains et 9 poules → 5/4, avec 8+6 → 6/3 etc.)
+        function proportionalSalles(n){
+            const k=Math.max(1,nbSalles), cap=Array.from({length:k},(_,i)=>Math.max(1,terrainsParSalle[i]||1));
+            const cnt=Array(k).fill(0), res=[];
+            for(let i=0;i<n;i++){
+                let best=0, bv=Infinity;
+                for(let s=0;s<k;s++){ const v=(cnt[s]+1)/cap[s]; if(v<bv-1e-9){ bv=v; best=s; } }
+                cnt[best]++; res.push(best);
+            }
+            return res;
         }
 
         function updateCounters(){
@@ -327,7 +343,7 @@
             let n=teamsList.length, matches=[], id=startId;
 
             // Salle fixe pour ce groupe : groupes pairs→salle 0, impairs→salle 1 (si 2 salles)
-            let salleIdx = nbSalles > 1 ? (groupIndex % nbSalles) : 0;
+            let salleIdx = nbSalles > 1 ? (proportionalSalles(Math.max(groupsP1.length,groupIndex+1))[groupIndex] ?? (groupIndex % nbSalles)) : 0;
             let salleTerrains = getTerrainsForSalle(salleIdx); // tableau de numéros de terrains (1-basé)
 
             // Round-robin de Berger
@@ -474,7 +490,7 @@
                 matchesHtml+=`</div>`;
             }
             matchesHtml+=`</div></div>`;
-            area.innerHTML=saisieBtns+groupsHtml+matchesHtml;
+            area.innerHTML=boardHtml('P1')+groupsHtml;
             area.querySelectorAll('.p1score').forEach(inp=>{ inp.removeEventListener('input',p1Handler); inp.addEventListener('input',p1Handler); });
             area.querySelectorAll('.terrain-select').forEach(sel=>{ sel.removeEventListener('change',terrainChangeHandler); sel.addEventListener('change',terrainChangeHandler); });
             area.querySelectorAll('.time-input').forEach(inp=>{ inp.addEventListener('change',function(){ updateMatchTime(parseInt(this.dataset.id),1,this.value); }); });
@@ -675,8 +691,10 @@
                 // (tous en salle 0, les terrains tournent)
                 return allGroups.map(()=>0);
             }
-            // 2+ salles : moitié haute → salle 0, moitié basse → salle 1
-            let splitAt=Math.floor(allGroups.length/2);
+            // 2 salles : poules les plus fortes dans la salle 0, découpage proportionnel aux terrains
+            // (avec un nombre impair de poules, la salle 0 prend la poule en plus : 9 poules → 5/4, 11 → 6/5)
+            let c0=Math.max(1,terrainsParSalle[0]||1), c1=Math.max(1,terrainsParSalle[1]||1);
+            let splitAt=Math.min(allGroups.length,Math.max(0,Math.floor(allGroups.length*c0/(c0+c1)+0.5)));
             return allGroups.map((_,i)=> i<splitAt ? 0 : 1);
         }
 
@@ -782,6 +800,35 @@
             showMsg(`Phase 2 Format E : ${matchesP2.length} matchs générés`);
         }
 
+        // Poules de P2 flexibles : chaque poule prend 1 équipe dans chacune des 4 tranches du classement P1
+        // (snake), puis on échange des équipes d'une même tranche entre poules pour supprimer les revanches
+        // de P1 en gardant des poules de force égale (somme des rangs la plus proche possible).
+        function optimizeFlexiblePools(sorted,n){
+            const pools=Array.from({length:n},(_,i)=>[i,2*n-1-i,2*n+i,4*n-1-i]);
+            const grpOf=sorted.map(t=>t?groupsP1.findIndex(g=>g.teams.some(x=>x.id===t.id)):-1);
+            const target=8*n-2;
+            const poolCost=p=>{
+                let c=0;
+                for(let a=0;a<4;a++) for(let b=a+1;b<4;b++){ const ga=grpOf[p[a]], gb=grpOf[p[b]]; if(ga>=0&&ga===gb) c+=100; }
+                return c+Math.abs(p.reduce((s,x)=>s+x,0)-target);
+            };
+            const total=()=>pools.reduce((s,p)=>s+poolCost(p),0);
+            for(let pass=0;pass<80;pass++){
+                let improved=false;
+                for(let band=0;band<4;band++){
+                    for(let p=0;p<n;p++) for(let q=p+1;q<n;q++){
+                        const before=poolCost(pools[p])+poolCost(pools[q]);
+                        [pools[p][band],pools[q][band]]=[pools[q][band],pools[p][band]];
+                        const after=poolCost(pools[p])+poolCost(pools[q]);
+                        if(after<before){ improved=true; }
+                        else { [pools[p][band],pools[q][band]]=[pools[q][band],pools[p][band]]; }
+                    }
+                }
+                if(!improved) break;
+            }
+            return pools;
+        }
+
         // Phase 2 adaptable pour 32, 36, 44 ou 48 équipes.
         // Chaque poule contient 4 équipes issues de niveaux P1 différents.
         function genPhase2Flexible(){
@@ -789,15 +836,16 @@
             for(let i=1;i<all.length;i++){ let cur=all[i],j=i-1; while(j>=0&&cmpGeneralP1(all[j],cur)>0){all[j+1]=all[j];j--;} all[j+1]=cur; }
             const nGroups=teams.length/4;
             const sorted=all.map(x=>x.team);
+            const flexPools=optimizeFlexiblePools(sorted,nGroups);
             groupsP2E=[];
             for(let i=0;i<nGroups;i++){
-                const idxs=[i,2*nGroups-1-i,2*nGroups+i,4*nGroups-1-i];
+                const idxs=flexPools[i];
                 const poolTeams=idxs.map(idx=>sorted[idx]).filter(Boolean);
                 groupsP2E.push({name:`POULE ${groupLabel(i)}`,category:'general',teams:poolTeams,originalRanks:idxs});
             }
             genMatchesFromGroupsE();
             renderPhase2UI(); renderSchedule(); updateCounters(); saveData(); updateTopRecap();
-            showMsg(`Phase 2 : ${nGroups} poules de 4 générées pour ${teams.length} équipes`);
+            { const rv=detectConflictsFormatE().length; showMsg(`Phase 2 : ${nGroups} poules de 4 générées pour ${teams.length} équipes`+(rv?` · ${rv} revanche(s) de P1 restante(s)`:' · aucune revanche de P1')); }
         }
 
         function detectConflictsFormatE(){
@@ -965,7 +1013,7 @@
                     fullHtml+=`<div class="panel"><div class="panel-header"><span style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
                         <span class="phase-badge" style="background:rgba(0,0,0,0.06);color:${color};border:1px solid ${color};">${catLabels[cat]}</span>
                         <b>${gName}</b>${salle}</span></div><div class="panel-body">`;
-                    matches.forEach(m=>{
+                    [].forEach(m=>{
                         let played=isPlayed(m);
                         let terrainOptions=buildTerrainOptions(m.terrain);
                         fullHtml+=`<div class="match-row${played?' played':''}">
@@ -993,7 +1041,7 @@
                 fullHtml+=`</div>`;
             });
 
-            area.innerHTML=saisieBtns+editGroupsHtml+fullHtml;
+            area.innerHTML=boardHtml('P2')+editGroupsHtml+fullHtml;
             area.querySelectorAll('.p2score').forEach(inp=>{ inp.removeEventListener('input',p2Handler); inp.addEventListener('input',p2Handler); });
             area.querySelectorAll('.terrain-select').forEach(sel=>{ sel.removeEventListener('change',terrainChangeHandler); sel.addEventListener('change',terrainChangeHandler); });
             area.querySelectorAll('.time-input').forEach(inp=>{ inp.addEventListener('change',function(){ updateMatchTime(parseInt(this.dataset.id),2,this.value); }); });
@@ -1163,7 +1211,7 @@
                 html+=`</div></div>`;
             });
 
-            area.innerHTML=html;
+            area.innerHTML=boardHtml('FIN');
             area.querySelectorAll('.fin-score').forEach(inp=>{ inp.removeEventListener('input',finalesHandler); inp.addEventListener('input',finalesHandler); });
             area.querySelectorAll('.terrain-select-fin').forEach(sel=>{
                 sel.addEventListener('change',function(){
@@ -1755,78 +1803,52 @@ window._smNav=function(idx){ _smSectionIdx=idx; renderScoreModal(); };
             readTimeSettings();
             let total=getTotalTerrains();
 
+            // Planning d'une phase : à chaque créneau on remplit tous les terrains de CHAQUE salle (les équipes
+            // restent dans leur salle). Priorité aux équipes « critiques » (qui n'ont plus de marge pour jouer
+            // tous leurs matchs), puis à celles qui n'ont pas joué au créneau précédent.
             function scheduleGlobal(matchList,startTimeStr,duration,pause){
                 if(!matchList.length) return;
                 let slotDur=duration+pause, startMin=timeToMin(startTimeStr);
-                matchList.forEach(m=>m.startTime='');
-
-                // salleRef est la salle fixe du groupe (définie à la génération, jamais modifiée)
-                function getMatchSalle(m){
-                    if(m.salleRef!=null) return m.salleRef;
-                    if(m.terrain) return getSalleForTerrain(m.terrain);
-                    return 0;
-                }
-
-                let remaining=[...matchList], wave=0, busyInPrevWave=new Set(), lastPlayedWave={};
-                while(remaining.length>0){
-                    let waveTime=startMin+wave*slotDur;
-                    let busyInWave=new Set(), waveMatches=[];
-                    let busyTerrains=new Set();
-
-                    // Remplir le créneau : continuer tant qu'on peut placer un match
-                    // (un match par terrain libre, toutes salles confondues dans le même créneau)
-                    let keepGoing=true;
-                    while(keepGoing && remaining.length>0){
-                        keepGoing=false;
-
-                        // Priorité : équipes qui n'ont pas joué au créneau précédent
-                        let candidates=remaining.filter(m=>
-                            !busyInPrevWave.has(m.team1?.id)&&!busyInPrevWave.has(m.team2?.id)&&
-                            !busyInWave.has(m.team1?.id)&&!busyInWave.has(m.team2?.id)
-                        );
-                        // Fallback : équipes simplement libres ce créneau
-                        if(!candidates.length) candidates=remaining.filter(m=>
-                            !busyInWave.has(m.team1?.id)&&!busyInWave.has(m.team2?.id)
-                        );
-                        if(!candidates.length) break;
-
-                        // Favoriser les équipes les plus longtemps au repos
-                        candidates.sort((a,b)=>{
-                            let lastA=Math.max(lastPlayedWave[a.team1?.id]??-99,lastPlayedWave[a.team2?.id]??-99);
-                            let lastB=Math.max(lastPlayedWave[b.team1?.id]??-99,lastPlayedWave[b.team2?.id]??-99);
-                            return lastA-lastB;
-                        });
-
-                        // Chercher un candidat avec un terrain libre dans SA salle
-                        let chosen=null, chosenTerrain=null;
-                        for(let cand of candidates){
-                            let salle=getMatchSalle(cand);
-                            let terrains=getTerrainsForSalle(salle);
-                            let free=terrains.find(t=>!busyTerrains.has(t));
-                            if(free!=null){ chosen=cand; chosenTerrain=free; break; }
+                matchList.forEach(m=>{ m.startTime=''; });
+                const salleOf=m=>m.salleRef!=null ? m.salleRef : (m.terrain ? getSalleForTerrain(m.terrain) : 0);
+                const tid=(t)=>t?t.id:null;
+                const bySalle={};
+                matchList.forEach(m=>{ (bySalle[salleOf(m)]=bySalle[salleOf(m)]||[]).push(m); });
+                const info={};   // par salle : matchs restants, besoin par équipe, nb de créneaux visé
+                Object.keys(bySalle).forEach(k=>{
+                    const ms=bySalle[k], need={};
+                    ms.forEach(m=>{ [tid(m.team1),tid(m.team2)].forEach(id=>{ need[id]=(need[id]||0)+1; }); });
+                    const cap=Math.max(1,getTerrainsForSalle(+k).length);
+                    info[k]={remaining:[...ms],need,cap,W:Math.max(Math.max(...Object.values(need)),Math.ceil(ms.length/cap))};
+                });
+                let wave=0, lastPlayed={}, guard=0;
+                const left=()=>Object.values(info).reduce((a,x)=>a+x.remaining.length,0);
+                while(left()>0 && guard++<500){
+                    const waveTime=startMin+wave*slotDur, busy=new Set();
+                    Object.keys(info).forEach(k=>{
+                        const I=info[k]; if(!I.remaining.length) return;
+                        const terrains=getTerrainsForSalle(+k), usedT=new Set();
+                        const wavesLeft=Math.max(1,I.W-wave);
+                        let placed=0;
+                        while(placed<I.cap && I.remaining.length){
+                            const cand=I.remaining.filter(m=>!busy.has(tid(m.team1))&&!busy.has(tid(m.team2)));
+                            if(!cand.length) break;
+                            const score=m=>{
+                                const a=tid(m.team1), b=tid(m.team2);
+                                const crit=(I.need[a]>=wavesLeft?1:0)+(I.need[b]>=wavesLeft?1:0);
+                                const justPlayed=((lastPlayed[a]===wave-1)?1:0)+((lastPlayed[b]===wave-1)?1:0);
+                                return crit*1000 - justPlayed*100 + (I.need[a]+I.need[b]);
+                            };
+                            cand.sort((x,y)=>score(y)-score(x));
+                            const chosen=cand[0];
+                            const free=terrains.find(t=>!usedT.has(t));
+                            if(free==null) break;
+                            I.remaining.splice(I.remaining.indexOf(chosen),1);
+                            chosen.startTime=minToTime(waveTime); chosen.terrain=free; usedT.add(free);
+                            [tid(chosen.team1),tid(chosen.team2)].forEach(id=>{ busy.add(id); I.need[id]--; lastPlayed[id]=wave; });
+                            placed++;
                         }
-                        if(!chosen) break; // tous les terrains disponibles sont occupés
-
-                        remaining.splice(remaining.indexOf(chosen),1);
-                        chosen.startTime=minToTime(waveTime);
-                        chosen.terrain=chosenTerrain;
-                        busyInWave.add(chosen.team1?.id); busyInWave.add(chosen.team2?.id);
-                        busyTerrains.add(chosenTerrain);
-                        lastPlayedWave[chosen.team1?.id]=wave; lastPlayedWave[chosen.team2?.id]=wave;
-                        waveMatches.push(chosen);
-                        keepGoing=true; // continuer : peut-être d'autres terrains libres
-                    }
-
-                    busyInPrevWave=busyInWave;
-                    // Sécurité anti-boucle infinie : forcer le premier match restant
-                    if(!waveMatches.length&&remaining.length){
-                        let m=remaining.shift();
-                        let terrains=getTerrainsForSalle(getMatchSalle(m));
-                        m.startTime=minToTime(waveTime);
-                        m.terrain=terrains[0]||1;
-                        busyInPrevWave=new Set([m.team1?.id,m.team2?.id]);
-                        lastPlayedWave[m.team1?.id]=wave; lastPlayedWave[m.team2?.id]=wave;
-                    }
+                    });
                     wave++;
                 }
             }
@@ -2094,7 +2116,7 @@ window._smNav=function(idx){ _smSectionIdx=idx; renderScoreModal(); };
         async function saveDataToFirebase(data){
             if(!db||(!isAdmin&&!isSaisie)) return;
             try {
-                await setDoc(doc(db,'tournoi','data_flexible'),{
+                await setDoc(doc(db,'flex','current'),{
                     teams:data.teams, groupsP1:data.groupsP1, matchesP1:data.matchesP1, matchesP2:data.matchesP2,
                     matchesFinales:data.matchesFinales, groupsP2E:data.groupsP2E,
                     nbTerrains:data.nbTerrains, nbSalles:data.nbSalles,
@@ -2138,7 +2160,7 @@ window._smNav=function(idx){ _smSectionIdx=idx; renderScoreModal(); };
             if(!db) return;
             if(unsubscribeSnapshot){ unsubscribeSnapshot(); unsubscribeSnapshot=null; }
             try {
-                const docRef=doc(db,'tournoi','data_flexible');
+                const docRef=doc(db,'flex','current');
                 lastDataStamp='';
                 unsubscribeSnapshot=onSnapshot(docRef,(docSnap)=>{
                     if(docSnap.exists()){
@@ -2154,7 +2176,7 @@ window._smNav=function(idx){ _smSectionIdx=idx; renderScoreModal(); };
         }
 
         // ============ AUTHENTIFICATION ============
-        function updateUIForUser(user){
+        async function updateUIForUser(user){
             const loginOverlay=document.getElementById('loginOverlay');
             const mainApp=document.getElementById('mainApp');
             const userEmailSpan=document.getElementById('userEmail');
@@ -2170,10 +2192,15 @@ window._smNav=function(idx){ _smSectionIdx=idx; renderScoreModal(); };
             if(user){
                 currentUser=user;
                 if(window.hideLoginScreen) window.hideLoginScreen();
-                const adminEmails=["yves.cerisier@orange.fr","quinquin44@gmail.com","checheux@gmail.com"];
-                isAdmin=adminEmails.includes(user.email);
-                isSaisie=!isAdmin;
-                if(userEmailSpan) userEmailSpan.innerHTML=isAdmin?`<span class="admin-badge">👑 Admin</span>`:`<span class="readonly-badge">✏️ ${user.email}</span>`;
+                const prof=await getUserProfile(user);
+                USER_ROLES=prof.roles; CLUB_PROFILE={clubName:prof.clubName||prof.name||'Mon club',maxTeams:prof.maxTeams||0};
+                isAdmin=USER_ROLES.includes('admin')||RULE_ADMIN_EMAILS.includes((user.email||'').toLowerCase());
+                isSaisie=!isAdmin&&USER_ROLES.includes('scorer');
+                const hasClub=USER_ROLES.includes('club');
+                if(!isAdmin&&!isSaisie&&hasClub){ await showClubScreen(); return; }   // responsable de club : espace d'inscription
+                hideClubScreen();
+                toggleClubExtraNav((isAdmin||isSaisie)&&hasClub);
+                if(userEmailSpan) userEmailSpan.innerHTML=isAdmin?`<span class="admin-badge">👑 Admin</span>`:(isSaisie?`<span class="readonly-badge">✏️ Scorer · ${esc(user.email)}</span>`:`<span class="readonly-badge">👁 Spectateur · ${esc(user.email)}</span>`);
                 if(logoutBtn) logoutBtn.style.display='inline-block';
                 if(adminLoginBtn) adminLoginBtn.style.display='none';
                 if(usersTabBtn) usersTabBtn.style.display=isAdmin?'inline-block':'none';
@@ -2185,8 +2212,9 @@ window._smNav=function(idx){ _smSectionIdx=idx; renderScoreModal(); };
                 if(isAdmin){
                     showMsg("👑 Mode administrateur");
                 } else {
-                    document.body.classList.add('saisie-mode');
-                    showMsg("✏️ Mode saisie — "+(user.displayName||user.email));
+                    document.body.classList.add(isSaisie?'saisie-mode':'readonly-mode');
+                    if(!isSaisie) document.body.classList.add('visitor-mode');
+                    showMsg(isSaisie?"✏️ Mode saisie — "+(user.displayName||user.email):"👁 Mode spectateur — "+(user.displayName||user.email));
                     // Si onglet actif est config ou teams, rediriger vers phase1
                     const activeTab=document.querySelector('.tab.active');
                     if(activeTab&&(activeTab.dataset.tab==='config'||activeTab.dataset.tab==='teams')){
@@ -2194,11 +2222,11 @@ window._smNav=function(idx){ _smSectionIdx=idx; renderScoreModal(); };
                         if(p1Btn) p1Btn.click();
                     }
                 }
-                startRealtimeSync();
+                gatedStart();
                 if(window.refreshTabBar) window.refreshTabBar();
                 if(typeof renderTimerPanel==='function') renderTimerPanel();
             } else {
-                currentUser=null; isAdmin=false; isSaisie=false;
+                currentUser=null; isAdmin=false; isSaisie=false; USER_ROLES=[]; CLUB_PROFILE=null; hideClubScreen(); toggleClubExtraNav(false); unsubAdminAll();
                 if(!window._specEntered && window.showLoginScreen) window.showLoginScreen();
                 document.body.classList.add('readonly-mode','visitor-mode');
                 document.body.classList.remove('saisie-mode');
@@ -2215,7 +2243,7 @@ window._smNav=function(idx){ _smSectionIdx=idx; renderScoreModal(); };
                     const p1Btn=document.querySelector('.tab[data-tab="phase1"]');
                     if(p1Btn) p1Btn.click();
                 }
-                startRealtimeSync();
+                gatedStart();
                 if(window.refreshTabBar) window.refreshTabBar();
                 if(typeof renderTimerPanel==='function') renderTimerPanel();
             }
@@ -2230,38 +2258,291 @@ window._smNav=function(idx){ _smSectionIdx=idx; renderScoreModal(); };
             catch(error){ if(msg){msg.style.color='var(--danger)';msg.textContent=(error.code==='auth/wrong-password'||error.code==='auth/invalid-credential')?'❌ Mot de passe incorrect':error.code==='auth/user-not-found'?'❌ Email inconnu':'❌ '+error.message;} }
         }
 
-        function getSecondaryApp(){ if(!secondaryApp){ try{ secondaryApp=initializeApp(firebaseConfig,'secondary'); }catch(e){ secondaryApp=null; } } return secondaryApp; }
-
-        async function addUser(){
-            const email=document.getElementById('newUserEmail')?.value?.trim(), password=document.getElementById('newUserPassword')?.value, name=document.getElementById('newUserName')?.value?.trim()||'', msgEl=document.getElementById('addUserMsg');
-            if(!email||!password){ if(msgEl){msgEl.style.color='var(--danger)';msgEl.textContent='⚠️ Email et mot de passe requis';} return; }
-            if(password.length<6){ if(msgEl){msgEl.style.color='var(--danger)';msgEl.textContent='⚠️ Minimum 6 caractères';} return; }
-            if(msgEl){msgEl.style.color='var(--text-muted)';msgEl.textContent='⏳ Création...';}
-            try{
-                const secApp=getSecondaryApp(), secAuth=getAuth(secApp);
-                const result=await createUserWithEmailAndPassword(secAuth,email,password);
-                await signOut(secAuth);
-                await setDoc(doc(db,'authorizedUsers',result.user.uid),{email,name,createdAt:new Date().toISOString(),createdBy:currentUser?.email||'admin',role:'saisie'});
-                if(msgEl){msgEl.style.color='var(--accent)';msgEl.textContent=`✅ ${email} ajouté !`;}
-                ['newUserEmail','newUserPassword','newUserName'].forEach(id=>{ let el=document.getElementById(id); if(el) el.value=''; });
-                loadUsersList();
-            }catch(error){ let m='❌ '+error.message; if(error.code==='auth/email-already-in-use') m='⚠️ Email déjà utilisé'; if(error.code==='auth/invalid-email') m='⚠️ Email invalide'; if(msgEl){msgEl.style.color='var(--danger)';msgEl.textContent=m;} }
+        // ============ RÔLES · ESPACE CLUB · ADMINISTRATION (portés de l'appli RSTH ; mêmes comptes `users`) ============
+        let unsubUserList=null, unsubClubList=null, unsubPendingRegs=null, unsubClubTeams=null, unsubRegCounts=null, REG_PENDING=[];
+        function unsubAdminAll(){
+            [unsubUserList,unsubClubList,unsubPendingRegs,unsubClubTeams,unsubRegCounts].forEach(f=>{ try{ if(f) f(); }catch(e){} });
+            unsubUserList=unsubClubList=unsubPendingRegs=unsubClubTeams=unsubRegCounts=null;
         }
-
-        async function loadUsersList(){
-            const listEl=document.getElementById('usersList'); if(!listEl) return;
+        async function getUserProfile(user){
             try{
-                const snapshot=await getDocs(collection(db,'authorizedUsers'));
-                if(snapshot.empty){ listEl.innerHTML='<div style="color:var(--text-muted);text-align:center;padding:20px;">Aucun utilisateur autorisé.</div>'; return; }
-                let html=`<table style="width:100%;border-collapse:collapse;"><thead><tr style="border-bottom:2px solid var(--border);"><th style="padding:8px;text-align:left;font-size:0.7rem;color:var(--text-muted);">Email</th><th style="padding:8px;text-align:left;font-size:0.7rem;color:var(--text-muted);">Nom</th><th style="padding:8px;text-align:center;font-size:0.7rem;color:var(--text-muted);">Action</th></tr></thead><tbody>`;
-                snapshot.forEach(d=>{ const u=d.data(); html+=`<tr style="border-bottom:1px solid var(--border);"><td style="padding:8px;font-size:0.75rem;">${esc(u.email)}</td><td style="padding:8px;font-size:0.75rem;color:var(--text-muted);">${esc(u.name||'—')}</td><td style="padding:8px;text-align:center;"><button onclick="removeUser('${d.id}','${esc(u.email)}')" style="padding:4px 10px;border-radius:6px;border:none;background:var(--danger);color:#fff;cursor:pointer;font-size:0.7rem;font-family:'Exo 2',sans-serif;">🗑️</button></td></tr>`; });
-                html+='</tbody></table>';
-                listEl.innerHTML=html;
-            }catch(e){ listEl.innerHTML='<div style="color:var(--danger);text-align:center;padding:20px;">Erreur de chargement</div>'; }
+                const ref=doc(db,'users',user.uid); const snap=await getDoc(ref);
+                if(!snap.exists()){
+                    await setDoc(ref,{email:user.email,name:user.displayName||(user.email||'').split('@')[0],role:'spectator',roles:['spectator'],createdAt:serverTimestamp()});
+                    return {roles:['spectator'],name:user.displayName||'',clubName:'',maxTeams:0};
+                }
+                const d=snap.data();
+                const roles=Array.isArray(d.roles)&&d.roles.length?d.roles:[d.role||'spectator'];
+                return {roles,name:d.name||'',clubName:d.clubName||'',maxTeams:d.maxTeams||0};
+            }catch(e){ console.warn('getUserProfile',e); return {roles:['spectator'],name:'',clubName:'',maxTeams:0}; }
         }
+        const normName=s=>(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim().toLowerCase().replace(/\s+/g,' ');
+        function teamLockId(clubUid,p1,p2){
+            const pair=[normName(p1),normName(p2)].sort().join('__');
+            return clubUid+'__'+(pair.replace(/[^a-z0-9_]+/g,'_').replace(/^_+|_+$/g,'').slice(0,140)||'equipe');
+        }
+        const setMsg=(id,txt,color)=>{ const el=document.getElementById(id); if(el){ el.textContent=txt; el.style.color=color==='red'?'var(--red)':(color==='green'?'var(--grn)':'var(--muted)'); } };
 
-        async function removeUser(uid,email){ if(!confirm(`Retirer l'accès à ${email} ?`)) return; try{ await deleteDoc(doc(db,'authorizedUsers',uid)); showMsg(`✅ ${email} retiré`); loadUsersList(); }catch(e){ showMsg('❌ Erreur suppression'); } }
-        async function logout(){ window._specEntered=false; try{ await signOut(auth); showMsg("Déconnecté"); updateUIForUser(null); }catch(error){ console.error("Erreur déconnexion:",error); } }
+        // ── Espace club : inscription des équipes par le responsable de club ──
+        window.toggleClubExtraNav=function(show){
+            ['clubExtraBtn','drawerClubExtraBtn'].forEach(id=>{ const b=document.getElementById(id); if(b) b.style.display=show?'':'none'; });
+        };
+        window.toggleClubExtraNav=window.toggleClubExtraNav;
+        function hideClubScreen(){ const cs=document.getElementById('clubScreen'); if(cs) cs.style.display='none'; }
+        async function showClubScreen(){
+            if(window.hideLoginScreen) window.hideLoginScreen();
+            window._specEntered=true;
+            const main=document.getElementById('mainApp'); if(main) main.style.display='none';
+            const cs=document.getElementById('clubScreen'); if(cs) cs.style.display='block';
+            const nm=document.getElementById('clubHdrName'); if(nm) nm.textContent='🏟️ '+(CLUB_PROFILE?CLUB_PROFILE.clubName:'Mon club');
+            const staff=isAdmin||isSaisie;
+            const back=document.getElementById('clubBackToAppBtn'), out=document.getElementById('clubLogoutBtn');
+            if(back) back.style.display=staff?'':'none'; if(out) out.style.display=staff?'none':'';
+            loadClubTeams();
+        }
+        window.openClubFromApp=function(){ showClubScreen(); };
+        window.returnToAppFromClub=function(){ hideClubScreen(); const main=document.getElementById('mainApp'); if(main) main.style.display='block'; };
+        window.clubLogout=async function(){ CLUB_PROFILE=null; CLUB_TEAMS=[]; CLUB_EDIT_ID=null; unsubAdminAll(); try{ await signOut(auth); }catch(e){} hideClubScreen(); if(window.showLoginScreen) window.showLoginScreen(); };
+        function loadClubTeams(){
+            if(unsubClubTeams){ renderClubScreen(); return; }
+            const list=document.getElementById('clubTeamsList'); if(list) list.innerHTML='<div style="color:var(--muted);padding:10px 0">Chargement…</div>';
+            const q=query(collection(db,'flex_registrations'),where('clubUid','==',currentUser.uid));
+            unsubClubTeams=onSnapshot(q,(snap)=>{
+                CLUB_TEAMS=[]; snap.forEach(d=>CLUB_TEAMS.push({id:d.id,...d.data()}));
+                CLUB_TEAMS.sort((a,b)=>(a.createdAtMs||0)-(b.createdAtMs||0)); renderClubScreen();
+            },()=>{ CLUB_TEAMS=[]; renderClubScreen(); });
+        }
+        window.renderClubScreen=renderClubScreen;
+        window.clubEditStart=function(id){ CLUB_EDIT_ID=id; renderClubScreen(); };
+        window.clubEditCancel=function(){ CLUB_EDIT_ID=null; renderClubScreen(); };
+        function renderClubScreen(){
+            const used=CLUB_TEAMS.length, max=CLUB_PROFILE?CLUB_PROFILE.maxTeams:0;
+            const q=document.getElementById('clubQuota'); if(q) q.textContent=`${used} / ${max} équipe${max>1?'s':''} inscrite${used>1?'s':''}`;
+            const form=document.getElementById('clubAddForm'); if(form) form.style.display=(used<max)?'':'none';
+            const full=document.getElementById('clubQuotaFullMsg'); if(full) full.style.display=(used>=max)?'':'none';
+            const list=document.getElementById('clubTeamsList'); if(!list) return;
+            if(!CLUB_TEAMS.length){ list.innerHTML='<div style="color:var(--muted);padding:10px 0;font-size:14px">Aucune équipe inscrite pour l\'instant.</div>'; return; }
+            list.innerHTML=CLUB_TEAMS.map(t=>{
+                const imported=t.status==='imported';
+                const badge=imported?'<span style="color:var(--grn);font-size:12px;font-weight:700">✅ Validée — intégrée au tournoi</span>':'<span style="color:var(--ylw);font-size:12px;font-weight:700">⏳ En attente de validation</span>';
+                if(CLUB_EDIT_ID===t.id){
+                    return `<div style="border:1px solid var(--bdr2);border-radius:10px;padding:12px;margin-bottom:10px;display:flex;flex-direction:column;gap:8px">
+                        <input type="text" id="clubEdit_name_${t.id}" value="${esc(t.teamName||'')}" placeholder="Nom de l'équipe">
+                        <div style="display:flex;gap:8px"><input type="text" id="clubEdit_p1_${t.id}" value="${esc(t.p1||'')}" placeholder="Joueur 1" style="flex:1"><input type="text" id="clubEdit_p2_${t.id}" value="${esc(t.p2||'')}" placeholder="Joueur 2" style="flex:1"></div>
+                        <input type="number" id="clubEdit_lv_${t.id}" value="${t.lv||3}" min="1" max="5" placeholder="Niveau (1-5)">
+                        <div style="display:flex;gap:8px"><button class="btn btn-primary btn-sm" onclick="clubSaveTeamEdit('${t.id}')">✓ Enregistrer</button><button class="btn btn-ghost btn-sm" onclick="clubEditCancel()">Annuler</button></div></div>`;
+                }
+                return `<div style="border:1px solid var(--bdr);border-radius:10px;padding:12px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+                    <div><div style="font-weight:700">${esc(t.teamName||'—')}</div><div style="color:var(--muted);font-size:13px">${esc(t.p1||'—')} &amp; ${esc(t.p2||'—')} · Niveau ${t.lv||3}</div><div style="margin-top:4px">${badge}</div></div>
+                    ${imported?'':`<div style="display:flex;gap:8px"><button class="btn btn-ghost btn-sm" onclick="clubEditStart('${t.id}')">✏️ Modifier</button><button class="btn btn-ghost btn-sm" style="border-color:var(--red);color:var(--red)" onclick="clubDeleteTeam('${t.id}')">🗑 Supprimer</button></div>`}</div>`;
+            }).join('');
+        }
+        window.clubAddTeam=async function(){
+            if(!USER_ROLES.includes('club')) return;
+            const used=CLUB_TEAMS.length, max=CLUB_PROFILE?CLUB_PROFILE.maxTeams:0;
+            if(used>=max){ alert("Quota d'équipes atteint pour votre club."); return; }
+            const name=document.getElementById('club_t_name').value.trim(), p1=document.getElementById('club_t_p1').value.trim(), p2=document.getElementById('club_t_p2').value.trim();
+            const lv=+document.getElementById('club_t_lv').value||3;
+            if(!name||!p1||!p2){ setMsg('clubAddMsg','Nom, Joueur 1 et Joueur 2 sont obligatoires.','red'); return; }
+            const btn=document.getElementById('clubAddBtn'); if(btn){ if(btn.disabled) return; btn.disabled=true; }
+            try{
+                // verrou anti-doublon (même paire de joueurs pour ce club) : « create » autorisé, jamais « update »
+                const lockId=teamLockId(currentUser.uid,p1,p2);
+                try{ await setDoc(doc(db,'flex_team_locks',lockId),{clubUid:currentUser.uid,p1,p2,createdAtMs:Date.now()}); }
+                catch(lockErr){ setMsg('clubAddMsg','❌ Cette paire de joueurs est déjà inscrite pour votre club (en attente ou déjà validée).','red'); return; }
+                await addDoc(collection(db,'flex_registrations'),{clubUid:currentUser.uid,clubName:CLUB_PROFILE.clubName,teamName:name,p1,p2,lv,teamLockId:lockId,status:'pending',createdAtMs:Date.now(),createdAt:serverTimestamp()});
+                ['club_t_name','club_t_p1','club_t_p2'].forEach(id=>{ const el=document.getElementById(id); if(el) el.value=''; });
+                const l=document.getElementById('club_t_lv'); if(l) l.value='3';
+                setMsg('clubAddMsg',"✅ Équipe inscrite, en attente de validation par l'organisateur.",'green'); setTimeout(()=>setMsg('clubAddMsg',''),4000);
+            }catch(e){ setMsg('clubAddMsg','❌ '+e.message,'red'); }
+            finally{ if(btn) btn.disabled=false; }
+        };
+        window.clubSaveTeamEdit=async function(id){
+            const name=document.getElementById('clubEdit_name_'+id).value.trim(), p1=document.getElementById('clubEdit_p1_'+id).value.trim(), p2=document.getElementById('clubEdit_p2_'+id).value.trim();
+            const lv=+document.getElementById('clubEdit_lv_'+id).value||3;
+            if(!name||!p1||!p2){ alert('Nom, Joueur 1 et Joueur 2 sont obligatoires.'); return; }
+            try{
+                const ex=CLUB_TEAMS.find(t=>t.id===id), newLock=teamLockId(currentUser.uid,p1,p2), upd={teamName:name,p1,p2,lv};
+                if(!ex||ex.teamLockId!==newLock){
+                    try{ await setDoc(doc(db,'flex_team_locks',newLock),{clubUid:currentUser.uid,p1,p2,createdAtMs:Date.now()}); }
+                    catch(e){ alert('Cette paire de joueurs est déjà inscrite pour votre club.'); return; }
+                    if(ex&&ex.teamLockId){ try{ await deleteDoc(doc(db,'flex_team_locks',ex.teamLockId)); }catch(e){} }
+                    upd.teamLockId=newLock;
+                }
+                await updateDoc(doc(db,'flex_registrations',id),upd); CLUB_EDIT_ID=null;
+            }catch(e){ alert('Erreur : '+e.message); }
+        };
+        window.clubDeleteTeam=async function(id){
+            if(!confirm('Supprimer cette équipe de votre inscription ?')) return;
+            try{ const t=CLUB_TEAMS.find(x=>x.id===id); await deleteDoc(doc(db,'flex_registrations',id)); if(t&&t.teamLockId){ try{ await deleteDoc(doc(db,'flex_team_locks',t.teamLockId)); }catch(e){} } }
+            catch(e){ alert('Erreur : '+e.message); }
+        };
+
+        // ── Administration : comptes, rôles, clubs, inscriptions ──
+        const ROLE_ICON={admin:'👑',scorer:'✏️',spectator:'👁',club:'🏟️'};
+        const rolesOf=u=>Array.isArray(u.roles)&&u.roles.length?u.roles:[u.role||'spectator'];
+        window.loadAdminPanel=function(){ if(!isAdmin) return; loadUserList(); loadClubList(); loadPendingRegistrations(); };
+        window.toggleNewUClubFields=function(){ const on=[...document.querySelectorAll('.newU_roleChk:checked')].some(c=>c.value==='club'); const w=document.getElementById('newU_clubFields'); if(w) w.style.display=on?'flex':'none'; };
+        window.toggleChgUClubFields=function(){ const on=[...document.querySelectorAll('.chgU_roleChk:checked')].some(c=>c.value==='club'); const w=document.getElementById('chgU_clubFields'); if(w) w.style.display=on?'flex':'none'; };
+        async function createAuthAccount(email,pwd){
+            // création du compte sans changer la session de l'administrateur (appel direct à l'API d'authentification)
+            const res=await fetch('https://identitytoolkit.googleapis.com/v1/accounts:signUp?key='+firebaseConfig.apiKey,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password:pwd,returnSecureToken:true})});
+            const data=await res.json(); if(data.error) throw new Error(data.error.message==='EMAIL_EXISTS'?'Email déjà utilisé.':data.error.message);
+            return data.localId;
+        }
+        window.adminCreateUser=async function(){
+            if(!isAdmin) return;
+            const name=document.getElementById('newU_name').value.trim(), email=document.getElementById('newU_email').value.trim(), pwd=document.getElementById('newU_pwd').value;
+            const roles=[...document.querySelectorAll('.newU_roleChk:checked')].map(c=>c.value);
+            if(!name||!email||!pwd){ setMsg('newUserMsg','Tous les champs sont requis.','red'); return; }
+            if(pwd.length<6){ setMsg('newUserMsg','Mot de passe : 6 caractères minimum.','red'); return; }
+            if(!roles.length){ setMsg('newUserMsg','Sélectionnez au moins un rôle.','red'); return; }
+            let clubName='',maxTeams=0;
+            if(roles.includes('club')){ clubName=document.getElementById('newU_club').value.trim(); maxTeams=+document.getElementById('newU_maxTeams').value||0; if(!clubName||maxTeams<1){ setMsg('newUserMsg','Club et quota (≥1) requis pour un responsable club.','red'); return; } }
+            try{
+                setMsg('newUserMsg','⏳ Création…');
+                const uid=await createAuthAccount(email,pwd);
+                const u={email,name,role:roles[0],roles,createdAt:serverTimestamp(),createdBy:currentUser.uid}; if(roles.includes('club')){ u.clubName=clubName; u.maxTeams=maxTeams; }
+                await setDoc(doc(db,'users',uid),u);
+                setMsg('newUserMsg',`✅ Compte créé : ${name} (${roles.join(', ')})`,'green');
+                ['newU_name','newU_email','newU_pwd'].forEach(id=>document.getElementById(id).value=''); document.querySelectorAll('.newU_roleChk').forEach(c=>c.checked=false); toggleNewUClubFields();
+                setTimeout(()=>setMsg('newUserMsg',''),4000);
+            }catch(e){ setMsg('newUserMsg','❌ '+e.message,'red'); }
+        };
+        window.loadUserRolesIntoForm=async function(){
+            if(!isAdmin) return; const uid=document.getElementById('adminUidInput').value.trim();
+            if(!uid){ setMsg('adminRoleMsg','UID requis.','red'); return; }
+            try{
+                const snap=await getDoc(doc(db,'users',uid)); if(!snap.exists()){ setMsg('adminRoleMsg','❌ Utilisateur introuvable.','red'); return; }
+                const d=snap.data(), roles=rolesOf(d);
+                document.querySelectorAll('.chgU_roleChk').forEach(c=>c.checked=roles.includes(c.value));
+                document.getElementById('chgU_club').value=d.clubName||''; document.getElementById('chgU_maxTeams').value=d.maxTeams||2; toggleChgUClubFields();
+                setMsg('adminRoleMsg','✅ Rôles actuels chargés : '+roles.join(', '),'green');
+            }catch(e){ setMsg('adminRoleMsg','❌ '+e.message,'red'); }
+        };
+        window.setUserRole=async function(){
+            if(!isAdmin) return; const uid=document.getElementById('adminUidInput').value.trim();
+            const roles=[...document.querySelectorAll('.chgU_roleChk:checked')].map(c=>c.value);
+            if(!uid){ setMsg('adminRoleMsg','UID requis.','red'); return; }
+            if(!roles.length){ setMsg('adminRoleMsg','Sélectionnez au moins un rôle.','red'); return; }
+            const upd={role:roles[0],roles};
+            if(roles.includes('club')){ const c=document.getElementById('chgU_club').value.trim(), m=+document.getElementById('chgU_maxTeams').value||0; if(!c||m<1){ setMsg('adminRoleMsg','Club et quota (≥1) requis.','red'); return; } upd.clubName=c; upd.maxTeams=m; }
+            try{ await setDoc(doc(db,'users',uid),upd,{merge:true}); setMsg('adminRoleMsg','✅ Rôle(s) mis à jour.','green'); setTimeout(()=>setMsg('adminRoleMsg',''),3000); }
+            catch(e){ setMsg('adminRoleMsg','❌ '+e.message,'red'); }
+        };
+        window.copyUID=function(uid,btn){
+            const done=()=>{ if(!btn) return; const o=btn.textContent; btn.textContent='✅'; setTimeout(()=>{ btn.textContent=o; },1200); };
+            if(navigator.clipboard&&navigator.clipboard.writeText) navigator.clipboard.writeText(uid).then(done).catch(()=>prompt('UID :',uid)); else prompt('UID :',uid);
+        };
+        window.adminEditUserRole=async function(uid){ const i=document.getElementById('adminUidInput'); if(i) i.value=uid; await window.loadUserRolesIntoForm(); if(i) i.scrollIntoView({behavior:'smooth',block:'center'}); };
+        window.deleteUserFromList=async function(uid){
+            if(!isAdmin||!confirm('Supprimer cet utilisateur de la base (le compte de connexion reste à retirer dans la console Firebase) ?')) return;
+            try{ await deleteDoc(doc(db,'users',uid)); }catch(e){ alert('Erreur : '+e.message); }
+        };
+        function loadUserList(){
+            if(!isAdmin) return; const body=document.getElementById('userListBody'); if(!body||unsubUserList) return;
+            body.innerHTML='<tr><td colspan="5" style="color:var(--muted);padding:10px 0">Chargement…</td></tr>';
+            unsubUserList=onSnapshot(collection(db,'users'),(snap)=>{
+                if(snap.empty){ body.innerHTML='<tr><td colspan="5" style="color:var(--muted);padding:10px 0">Aucun utilisateur.</td></tr>'; return; }
+                const rows=[]; snap.forEach(d=>rows.push({uid:d.id,...d.data()})); rows.sort((a,b)=>(a.name||a.email||'').localeCompare(b.name||b.email||''));
+                body.innerHTML=rows.map(u=>`<tr style="border-bottom:1px solid var(--bdr);font-size:13px">
+                    <td style="padding:8px 6px;font-weight:600">${esc(u.name||'—')}</td>
+                    <td style="padding:8px 6px;color:var(--muted);font-size:12px">${esc(u.email||'—')}</td>
+                    <td style="padding:8px 6px"><span style="font-family:monospace;font-size:11px;color:var(--muted)" title="${u.uid}">${u.uid.slice(0,6)}…${u.uid.slice(-4)}</span> <button class="btn btn-ghost btn-sm" style="padding:2px 6px" onclick="copyUID('${u.uid}',this)">📋</button></td>
+                    <td style="padding:8px 6px">${rolesOf(u).map(r=>(ROLE_ICON[r]||'?')+' '+r).join(' · ')}</td>
+                    <td style="padding:8px 6px;white-space:nowrap"><button class="btn btn-ghost btn-sm" onclick="adminEditUserRole('${u.uid}')">✏️</button> <button class="btn btn-ghost btn-sm" style="color:var(--red);border-color:var(--red)" onclick="deleteUserFromList('${u.uid}')">🗑</button></td></tr>`).join('');
+            },(e)=>{ body.innerHTML=`<tr><td colspan="5" style="color:var(--red);padding:10px 0">Erreur : ${esc(e.message)}</td></tr>`; });
+        }
+        window.adminCreateClub=async function(){
+            if(!isAdmin) return;
+            const clubName=document.getElementById('newC_name').value.trim(), email=document.getElementById('newC_email').value.trim(), pwd=document.getElementById('newC_pwd').value, maxTeams=+document.getElementById('newC_max').value||1;
+            if(!clubName||!email||!pwd){ setMsg('newClubMsg','Tous les champs sont requis.','red'); return; }
+            if(pwd.length<6){ setMsg('newClubMsg','Mot de passe : 6 caractères minimum.','red'); return; }
+            try{
+                setMsg('newClubMsg','⏳ Création…');
+                const uid=await createAuthAccount(email,pwd);
+                await setDoc(doc(db,'users',uid),{email,clubName,name:clubName,role:'club',roles:['club'],maxTeams,createdAt:serverTimestamp(),createdBy:currentUser.uid});
+                setMsg('newClubMsg',`✅ Compte club créé : ${clubName} (${maxTeams} équipe${maxTeams>1?'s':''} max)`,'green');
+                ['newC_name','newC_email','newC_pwd'].forEach(id=>document.getElementById(id).value=''); document.getElementById('newC_max').value='1';
+                setTimeout(()=>setMsg('newClubMsg',''),5000);
+            }catch(e){ setMsg('newClubMsg','❌ '+e.message,'red'); }
+        };
+        function loadClubList(){
+            if(!isAdmin) return; const body=document.getElementById('clubListBody'); if(!body||unsubClubList) return;
+            body.innerHTML='<tr><td colspan="5" style="color:var(--muted);padding:10px 0">Chargement…</td></tr>';
+            let clubs=[], counts={};
+            const render=()=>{
+                if(!clubs.length){ body.innerHTML='<tr><td colspan="5" style="color:var(--muted);padding:10px 0">Aucun club créé.</td></tr>'; return; }
+                body.innerHTML=clubs.map(c=>`<tr style="border-bottom:1px solid var(--bdr);font-size:13px">
+                    <td style="padding:8px 6px;font-weight:600">${esc(c.clubName||c.name||'—')}</td><td style="padding:8px 6px;color:var(--muted);font-size:12px">${esc(c.email||'—')}</td>
+                    <td style="padding:8px 6px">${counts[c.uid]||0} / ${c.maxTeams||0}</td>
+                    <td style="padding:8px 6px"><input type="number" min="0" id="clubMax_${c.uid}" value="${c.maxTeams||0}" style="width:60px;padding:3px 6px"> <button class="btn btn-ghost btn-sm" onclick="updateClubQuota('${c.uid}')">OK</button></td>
+                    <td style="padding:8px 6px;text-align:center"><button class="btn btn-ghost btn-sm" style="color:var(--red);border-color:var(--red)" onclick="deleteClub('${c.uid}')">🗑</button></td></tr>`).join('');
+            };
+            unsubClubList=onSnapshot(collection(db,'users'),(snap)=>{ clubs=[]; snap.forEach(d=>{ const u=d.data(); if(rolesOf(u).includes('club')) clubs.push({uid:d.id,...u}); }); render(); },(e)=>{ body.innerHTML=`<tr><td colspan="5" style="color:var(--red);padding:10px 0">Erreur : ${esc(e.message)}</td></tr>`; });
+            unsubRegCounts=onSnapshot(collection(db,'flex_registrations'),(snap)=>{ counts={}; snap.forEach(d=>{ const r=d.data(); counts[r.clubUid]=(counts[r.clubUid]||0)+1; }); render(); });
+        }
+        window.updateClubQuota=async function(uid){ const v=+document.getElementById('clubMax_'+uid).value||0; try{ await updateDoc(doc(db,'users',uid),{maxTeams:v}); }catch(e){ alert('Erreur : '+e.message); } };
+        window.deleteClub=async function(uid){ if(!confirm('Supprimer ce club ? Ses équipes déjà validées restent dans le tournoi.')) return; try{ await deleteDoc(doc(db,'users',uid)); }catch(e){ alert('Erreur : '+e.message); } };
+
+        // ── Inscriptions en attente → équipes du tournoi (on remplit les places encore « par défaut ») ──
+        const isDefaultSlot=t=>/^Club \d+$/.test(t.club)&&/^Joueur \d+$/.test(t.player1)&&/^Joueur \d+$/.test(t.player2);
+        const freeSlots=()=>teams.filter(isDefaultSlot);
+        function importRegistration(r,id){
+            if(groupsP1.length){ alert("Le tirage de la Phase 1 est déjà fait : importez les équipes avant le tirage."); return null; }
+            const slot=freeSlots()[0]; if(!slot){ alert("Plus de place : augmentez le nombre d'équipes dans Config ou refusez des inscriptions."); return null; }
+            slot.club=r.teamName||r.clubName||slot.club; slot.player1=r.p1; slot.player2=r.p2; slot.clubName=r.clubName||''; slot.level=r.lv||3; slot.regId=id;
+            return slot;
+        }
+        function afterImport(){ renderTeamsEditor(); updateTopRecap(); saveData(); }
+        function loadPendingRegistrations(){
+            if(!isAdmin) return; const list=document.getElementById('pendingRegList'); if(!list) return;
+            if(unsubPendingRegs){ renderPending(); return; }
+            list.innerHTML='<div style="color:var(--muted);padding:10px 0">Chargement…</div>';
+            unsubPendingRegs=onSnapshot(query(collection(db,'flex_registrations'),where('status','==','pending')),(snap)=>{
+                REG_PENDING=[]; snap.forEach(d=>REG_PENDING.push({id:d.id,...d.data()})); REG_PENDING.sort((a,b)=>(a.createdAtMs||0)-(b.createdAtMs||0)); renderPending();
+            },(e)=>{ list.innerHTML=`<div style="color:var(--red);padding:10px 0">Erreur : ${esc(e.message)}</div>`; });
+        }
+        window.renderPendingRegs=renderPending;
+        function renderPending(){
+            const list=document.getElementById('pendingRegList'); if(!list) return;
+            const free=freeSlots().length, cap=teams.length;
+            const capEl=document.getElementById('pendingRegCap');
+            if(capEl){ capEl.textContent=`${cap-free} / ${cap} équipes déjà renseignées — ${free} place${free>1?'s':''} restante${free>1?'s':''}${groupsP1.length?' · ⚠️ tirage déjà fait : import impossible':''}`; capEl.style.color=(free<=0||groupsP1.length)?'var(--red)':(free<=REG_PENDING.length?'var(--ylw)':'var(--muted)'); }
+            const bulk=document.getElementById('regValidateAllBtn'); if(bulk) bulk.style.display=REG_PENDING.length?'':'none';
+            if(!REG_PENDING.length){ list.innerHTML='<div style="color:var(--muted);padding:10px 0;font-size:13px">Aucune inscription en attente.</div>'; return; }
+            list.innerHTML=REG_PENDING.map((r,i)=>`<div style="border:1px solid var(--bdr);border-radius:10px;padding:10px 12px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+                <div><div style="font-weight:700"><span style="font-size:11px;color:${i<free?'var(--grn)':'var(--ylw)'}">#${i+1}</span> ${esc(r.teamName||'—')} <span style="color:var(--muted);font-weight:400;font-size:12px">— ${esc(r.clubName||'—')}</span></div>
+                <div style="color:var(--muted);font-size:13px">${esc(r.p1||'—')} &amp; ${esc(r.p2||'—')} · Niveau ${r.lv||3}</div></div>
+                <div style="display:flex;gap:8px"><button class="btn btn-primary btn-sm" onclick="approveRegistration('${r.id}')" ${(free<=0||groupsP1.length)?'disabled':''}>✓ Valider</button><button class="btn btn-ghost btn-sm" style="border-color:var(--red);color:var(--red)" onclick="rejectRegistration('${r.id}')">✕ Refuser</button></div></div>`).join('');
+        }
+        window.approveRegistration=async function(id){
+            if(!isAdmin) return;
+            try{
+                const snap=await getDoc(doc(db,'flex_registrations',id)); if(!snap.exists()) return;
+                const slot=importRegistration(snap.data(),id); if(!slot) return;
+                afterImport(); await updateDoc(doc(db,'flex_registrations',id),{status:'imported',teamId:slot.id}); renderPending();
+            }catch(e){ alert('Erreur : '+e.message); }
+        };
+        window.approveAllPending=async function(){
+            if(!isAdmin) return;
+            const free=freeSlots().length; if(free<=0){ alert('Aucune place disponible.'); return; }
+            const todo=REG_PENDING.slice(0,free); if(!todo.length) return;
+            if(!confirm(`Valider les ${todo.length} plus ancienne(s) inscription(s) (dans la limite des ${free} place(s)) ?`)) return;
+            let ok=0;
+            for(const r of todo){
+                const slot=importRegistration(r,r.id); if(!slot) break;
+                try{ await updateDoc(doc(db,'flex_registrations',r.id),{status:'imported',teamId:slot.id}); ok++; }catch(e){ console.warn(e); }
+            }
+            afterImport(); renderPending(); alert(`${ok} équipe(s) validée(s).`);
+        };
+        window.rejectRegistration=async function(id){
+            if(!isAdmin||!confirm('Refuser et supprimer cette inscription ?')) return;
+            try{ const r=REG_PENDING.find(x=>x.id===id); await deleteDoc(doc(db,'flex_registrations',id)); if(r&&r.teamLockId){ try{ await deleteDoc(doc(db,'flex_team_locks',r.teamLockId)); }catch(e){} } }
+            catch(e){ alert('Erreur : '+e.message); }
+        };
+
+        async function logout(){ window._specEntered=false; unsubAdminAll(); CLUB_TEAMS=[]; CLUB_EDIT_ID=null; try{ await signOut(auth); showMsg("Déconnecté"); updateUIForUser(null); }catch(error){ console.error("Erreur déconnexion:",error); } }
 
         // ============ ÉVÉNEMENTS ============
         function attachEvents(){
@@ -2284,7 +2565,7 @@ window._smNav=function(idx){ _smSectionIdx=idx; renderScoreModal(); };
                     if(tabId==='schedule') renderSchedule();
                     if(tabId==='planning') renderPlanning();
                     if(tabId==='reglement') renderReglement();
-                    if(tabId==='users'&&isAdmin) loadUsersList();
+                    if(tabId==='users'&&isAdmin) loadAdminPanel();
                     window.scrollTo({top:0,behavior:'smooth'});
                 });
             });
@@ -2317,7 +2598,6 @@ window._smNav=function(idx){ _smSectionIdx=idx; renderScoreModal(); };
             });
 
             document.getElementById('scrollTopBtn').onclick=()=>window.scrollTo({top:0,behavior:'smooth'});
-            document.getElementById('printBtn').onclick=()=>{ document.querySelectorAll('.schedule-matches').forEach(el=>el.style.display='block'); window.print(); setTimeout(()=>document.querySelectorAll('.schedule-matches').forEach(el=>el.style.display='none'),500); };
 
             document.getElementById('drawBtn').onclick=()=>{ if(isAdmin){ randomMode=document.getElementById('randomDrawCheck').checked; currentFormat=document.querySelector('input[name="format"]:checked').value; doTirage(); } else showMsg("🔒 Accès administrateur requis"); };
             document.getElementById('genP1Btn').onclick=()=>{ if(isAdmin) genPhase1(); else showMsg("🔒 Accès administrateur requis"); };
@@ -2409,6 +2689,7 @@ window._smNav=function(idx){ _smSectionIdx=idx; renderScoreModal(); };
         window.openTV=function(){
             if(window.hideLoginScreen) window.hideLoginScreen();
             window._specEntered=true;
+            if(window.__liveBlocked&&window.__liveBlocked()){ const o=document.getElementById('liveClosedOverlay'); if(o) o.style.display='flex'; return; }
             document.body.classList.add('tv-mode');
             document.getElementById('pageTV').classList.add('active');
             tvClock(); clearInterval(tvClockTimer); tvClockTimer=setInterval(tvClock,1000);
@@ -2426,12 +2707,12 @@ window._smNav=function(idx){ _smSectionIdx=idx; renderScoreModal(); };
         document.addEventListener('keydown',e=>{ if(e.key==='Escape' && document.body.classList.contains('tv-mode')) window.closeTV(); });
 
 
-        // ============ MESSAGES + CHRONO (portés de l'appli RSTH ; stockés dans tournoi/data_flexible en fusion) ============
+        // ============ MESSAGES + CHRONO (portés de l'appli RSTH ; stockés dans flex/current en fusion) ============
         let MSGS=[], CHRONO={}, lastDataStamp='';
         const isStaff=()=>isAdmin||isSaisie;
         async function saveExtra(patch){
             if(!db||!isStaff()) return false;
-            try{ await setDoc(doc(db,'tournoi','data_flexible'),patch,{merge:true}); return true; }
+            try{ await setDoc(doc(db,'flex','current'),patch,{merge:true}); return true; }
             catch(e){ console.error('saveExtra',e); showMsg('⚠️ Enregistrement refusé : '+e.message); return false; }
         }
         window.__flexSync=function(d){
@@ -2651,14 +2932,285 @@ window._smNav=function(idx){ _smSectionIdx=idx; renderScoreModal(); };
             if(!isStaff()) return; const on=CHRONO.tvSound!==false; CHRONO.tvSound=!on; renderTimerPanel(); await saveExtra({chrono:{tvSound:!on}});
         };
 
+
+        // ============ IMPRESSION (aperçu + impression, comme l'appli RSTH) ============
+        const hasScore=m=>m&&m.score1!==undefined&&m.score1!==null&&m.score1!==''&&m.score2!==undefined&&m.score2!==null&&m.score2!=='';
+        const resolveT=t=>t?(teams.find(x=>x.id===t.id)||t):null;
+        const tName=t=>{ const T=resolveT(t); return T?esc(T.club||'—'):'—'; };
+        const tPlayers=t=>{ const T=resolveT(t); return T?esc([T.player1,T.player2].filter(Boolean).join(' & ')):''; };
+        const salleLbl=i=>{ const n=(typeof salleNames!=='undefined'&&salleNames&&salleNames[+i])?salleNames[+i]:null; return esc(n||('Salle '+((+i||0)+1))); };
+        const PH_LABEL={P1:'Phase 1 — Poules',P2:'Phase 2',FIN:'Matchs de classement'};
+        function phaseList(ph){
+            if(ph==='P1') return matchesP1.map(m=>({m,lbl:m.group||''}));
+            if(ph==='P2') return matchesP2.map(m=>({m,lbl:m.groupName||''}));
+            return matchesFinales.map(m=>({m,lbl:`${m.rank1}e–${m.rank2}e`}));
+        }
+        function sortByTime(list){
+            return list.slice().sort((a,b)=>String(a.m.startTime||'99:99').localeCompare(String(b.m.startTime||'99:99'))||((a.m.salleRef||0)-(b.m.salleRef||0))||((a.m.terrain||0)-(b.m.terrain||0)));
+        }
+        function docHead(title,sub){
+            return `<h1>🏓 ${esc(title)}</h1><div class="sub">${esc(sub||'')} · édité le ${new Date().toLocaleDateString('fr-FR')} à ${new Date().toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'})}</div>`;
+        }
+        function programTable(ph){
+            const list=sortByTime(phaseList(ph)); if(!list.length) return '';
+            let last=null;
+            const rows=list.map(({m,lbl})=>{
+                const first=m.startTime!==last; last=m.startTime;
+                const sc=hasScore(m)?`${esc(String(m.score1))} – ${esc(String(m.score2))}`:'';
+                return `<tr class="${first?'newslot':''}"><td style="white-space:nowrap"><b>${first?esc(m.startTime||'—'):''}</b></td><td>${salleLbl(m.salleRef)}</td><td style="text-align:center">${esc(String(m.terrain||'—'))}</td><td>${esc(lbl)}</td>
+                    <td><b>${tName(m.team1)}</b><div style="color:#555;font-size:10px">${tPlayers(m.team1)}</div></td><td><b>${tName(m.team2)}</b><div style="color:#555;font-size:10px">${tPlayers(m.team2)}</div></td><td style="text-align:center;width:80px"><span class="sc">${sc}</span></td></tr>`;
+            }).join('');
+            return `<h2>${PH_LABEL[ph]}</h2><table class="pt"><thead><tr><th>Heure</th><th>Salle</th><th>Terrain</th><th>${ph==='FIN'?'Places':'Poule'}</th><th>Équipe A</th><th>Équipe B</th><th>Score</th></tr></thead><tbody>${rows}</tbody></table>`;
+        }
+        function openPrint(title,html){
+            document.getElementById('printTitle').textContent=title;
+            document.getElementById('printContent').innerHTML=html;
+            document.getElementById('printModal').classList.add('open');
+            document.body.classList.add('print-open');
+            document.getElementById('printModal').scrollTop=0;
+        }
+        window.closePrint=function(){ document.getElementById('printModal').classList.remove('open'); document.body.classList.remove('print-open'); document.getElementById('printContent').innerHTML=''; };
+        window.printNow=function(){ window.print(); };
+        window.printProgram=function(ph){
+            const phases=ph==='ALL'?['P1','P2','FIN']:[ph];
+            const body=phases.map(programTable).join('');
+            if(!body){ showMsg('Rien à imprimer : générez d\'abord les matchs de cette phase.'); return; }
+            openPrint('Programmation — '+(ph==='ALL'?'tout le tournoi':PH_LABEL[ph]),docHead('Programmation du tournoi',ph==='ALL'?'Toutes les phases':PH_LABEL[ph])+body);
+        };
+        function slipHtml(t,ph){
+            const mine=sortByTime(phaseList(ph).filter(({m})=>(m.team1&&m.team1.id===t.id)||(m.team2&&m.team2.id===t.id)));
+            const groups=ph==='P1'?groupsP1:groupsP2E;
+            const g=groups.find(x=>x.teams.some(y=>y.id===t.id));
+            const pool=g?`<div class="pool"><b>${esc(g.name||'')}</b> : ${g.teams.map(y=>(y.id===t.id?'<u>':'')+tName(y)+(y.id===t.id?'</u>':'')).join(' · ')}</div>`:'';
+            const rows=mine.map(({m},i)=>{
+                const me=m.team1&&m.team1.id===t.id, opp=me?m.team2:m.team1;
+                return `<tr><td style="text-align:center">${i+1}</td><td style="white-space:nowrap"><b>${esc(m.startTime||'—')}</b></td><td>${salleLbl(m.salleRef)} · T${esc(String(m.terrain||'—'))}</td>
+                    <td><b>${tName(opp)}</b><div style="color:#555;font-size:10px">${tPlayers(opp)}</div></td><td style="text-align:center"><span class="sc"></span> – <span class="sc"></span></td></tr>`;
+            }).join('')||'<tr><td colspan="5" style="text-align:center;color:#777">Aucun match programmé</td></tr>';
+            return `<div class="slip"><div class="tn">${tName(t)}</div><div class="pl">${tPlayers(t)} — ${PH_LABEL[ph]}</div>${pool}
+                <table class="pt"><thead><tr><th style="width:26px">#</th><th>Heure</th><th>Salle · Terrain</th><th>Adversaire</th><th style="text-align:center;width:150px">Score (nous – eux)</th></tr></thead><tbody>${rows}</tbody></table>
+                <div style="display:flex;justify-content:space-between;font-size:11px;color:#444;margin-top:4px"><span>Victoires : ____ &nbsp; Nuls : ____ &nbsp; Défaites : ____</span><span>Signature capitaine : ______________</span></div></div>`;
+        }
+        window.printTeamSlips=function(ph){
+            const list=ph==='P1'?matchesP1:matchesP2;
+            if(!list.length){ showMsg('Générez d\'abord les matchs de cette phase.'); return; }
+            const inPhase=teams.filter(t=>list.some(m=>(m.team1&&m.team1.id===t.id)||(m.team2&&m.team2.id===t.id)))
+                .sort((a,b)=>String(a.club||'').localeCompare(String(b.club||''),'fr',{numeric:true}));
+            const html=docHead('Fiches équipes',PH_LABEL[ph])+inPhase.map((t,i)=>slipHtml(t,ph)+((i%2===1&&i<inPhase.length-1)?'<div class="slip-sep"></div>':'')).join('');
+            openPrint('Fiches équipes — '+PH_LABEL[ph],html);
+        };
+        function fillPrintTeamSel(){
+            const sel=document.getElementById('printTeamSel'); if(!sel) return;
+            const sig=teams.map(t=>t.id+':'+t.club).join('|'); if(sel.dataset.sig===sig) return; sel.dataset.sig=sig;
+            const cur=sel.value;
+            sel.innerHTML=teams.slice().sort((a,b)=>String(a.club||'').localeCompare(String(b.club||''),'fr',{numeric:true})).map(t=>`<option value="${t.id}">${esc(t.club||'—')}</option>`).join('');
+            if(cur) sel.value=cur;
+        }
+        setInterval(fillPrintTeamSel,1500);
+        window.printOneSlip=function(){
+            const sel=document.getElementById('printTeamSel'); const t=sel&&teams.find(x=>String(x.id)===sel.value);
+            if(!t){ showMsg('Choisissez une équipe.'); return; }
+            const ph=(matchesP2.some(m=>(m.team1&&m.team1.id===t.id)||(m.team2&&m.team2.id===t.id)))?null:'P1';
+            let html=docHead('Fiche équipe','Programmation')+slipHtml(t,'P1');
+            if(matchesP2.some(m=>(m.team1&&m.team1.id===t.id)||(m.team2&&m.team2.id===t.id))) html+=slipHtml(t,'P2');
+            openPrint('Fiche — '+(t.club||''),html);
+        };
+        window.printRanking=function(which){
+            const map={P1:['rankingP1Area',()=>renderRankingP1(),'Classement Phase 1'],P2:['rankingP2Area',()=>renderRankingP2(),'Classement Phase 2'],FINAL:['rankingArea',()=>updateGlobalRanking(),'Classement final']};
+            const [id,fn,title]=map[which];
+            try{ fn(); }catch(e){}
+            const area=document.getElementById(id);
+            if(!area||!area.querySelector('table')){ showMsg('Aucun classement à imprimer pour l\'instant.'); return; }
+            openPrint(title,docHead(title,'Points : victoire 3 · nul 2 · défaite 0')+'<div>'+area.innerHTML+'</div>');
+        };
+        document.addEventListener('keydown',e=>{ if(e.key==='Escape'&&document.getElementById('printModal').classList.contains('open')) window.closePrint(); });
+        window.addEventListener('afterprint',()=>{});
+
+
+        // ============ SAISIE DES SCORES : tableau par tour (comme l'appli RSTH) ============
+        const BOARD={P1:{tour:null,salle:'all',todo:false},P2:{tour:null,salle:'all',todo:false},FIN:{tour:null,salle:'all',todo:false}};
+        const BD_CAT={elite:'🏅 Élite',or:'🥇 Or',argent:'🥈 Argent',bronze:'🥉 Bronze',consol:'🎗️ Consolation',general:'🏓'};
+        const bdList=ph=>ph==='P1'?matchesP1:(ph==='P2'?matchesP2:matchesFinales);
+        const bdCan=()=>isAdmin||isSaisie;
+        const bdTourOf=m=>m.startTime||'';
+        const bdSalleOf=m=>{ if(nbSalles<=1) return 0; if(m.terrain) return getSalleForTerrain(+m.terrain); return m.salleRef||0; };
+        const bdSalleName=i=>esc((salleNames&&salleNames[i])||('Salle '+(i+1)));
+        function bdMeta(ph,m){
+            if(ph==='P1') return m.group?('Groupe '+esc(m.group)):'';
+            if(ph==='P2') return esc(m.groupName||'');
+            return (BD_CAT[m.category]||'')+' · '+m.rank1+'e / '+m.rank2+'e';
+        }
+        function bdTours(ph){ return [...new Set(bdList(ph).map(bdTourOf))].sort((a,b)=>(a||'99:99').localeCompare(b||'99:99')); }
+        function bdDefaultTour(ph,tours){
+            const list=bdList(ph);
+            for(const t of tours){ if(list.some(m=>bdTourOf(m)===t&&!isPlayed(m))) return t; }
+            return tours[tours.length-1];
+        }
+        function bdCard(ph,m){
+            const played=isPlayed(m), can=bdCan();
+            const s1=getScore(m.score1), s2=getScore(m.score2);
+            const w1=played&&s1>s2, w2=played&&s2>s1;
+            const t1=m.team1?esc(m.team1.club):'?', t2=m.team2?esc(m.team2.club):'?';
+            const pl=t=>t?esc([t.player1,t.player2].filter(Boolean).join(' / ')):'';
+            const inp=(side,v,win)=>`<input class="sinp${win?' win-s':''}" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="2" data-ph="${ph}" data-id="${m.id}" data-side="${side}" value="${v??''}" placeholder="–" ${can?'':'readonly'}>`;
+            const adm=isAdmin?`<div class="mc2-adm">Terrain <select class="bd-terrain" data-ph="${ph}" data-id="${m.id}">${buildTerrainOptions(m.terrain)}</select> 🕐 <input type="time" class="bd-time" data-ph="${ph}" data-id="${m.id}" value="${m.startTime||''}"></div>`:'';
+            return `<div class="mc2${played?' done-mc':''}" data-ph="${ph}" data-id="${m.id}">
+                <div class="mc2-top"><span class="mc2-court">T${m.terrain||'–'}</span>${nbSalles>1?`<span>${bdSalleName(bdSalleOf(m))}</span>`:''}<span>${bdMeta(ph,m)}</span>${m.startTime?`<span class="mc2-time">🕐 ${esc(m.startTime)}</span>`:''}
+                    <span class="mc2-state ${played?'ok':'todo'}">${played?'✓ Terminé':'À jouer'}</span></div>
+                <div class="mc2-row"><div class="mc2-team">${t1}<small>${pl(m.team1)}</small></div>${inp(1,m.score1,w1)}<span class="mc2-sep">–</span>${inp(2,m.score2,w2)}<div class="mc2-team b">${t2}<small>${pl(m.team2)}</small></div></div>
+                ${can?`<div class="mc2-foot">${adm}<button class="np-open" onclick="openNumpad('${ph}',${m.id})">📱 Pavé</button></div>`:''}</div>`;
+        }
+        function boardHtml(ph){
+            const list=bdList(ph); if(!list.length) return '';
+            const tours=bdTours(ph), st=BOARD[ph];
+            if(st.tour===null||!tours.includes(st.tour)) st.tour=bdDefaultTour(ph,tours);
+            const tabs=tours.map((t,i)=>{
+                const ms=list.filter(m=>bdTourOf(m)===t), done=ms.every(isPlayed);
+                return `<button class="rtab${t===st.tour?' active':''}${done?' done':''}" onclick="boardSetTour('${ph}','${t}')">Tour ${i+1}<span class="rtab-time">${t||'sans horaire'}${done?' ✓':''}</span></button>`;
+            }).join('');
+            const totalDone=list.filter(isPlayed).length;
+            let filt=`<div class="bd-filters">`;
+            if(nbSalles>1){
+                filt+=`<button class="bd-chip${st.salle==='all'?' active':''}" onclick="boardSetSalle('${ph}','all')">Toutes les salles</button>`;
+                for(let i=0;i<nbSalles;i++) filt+=`<button class="bd-chip${st.salle===String(i)?' active':''}" onclick="boardSetSalle('${ph}','${i}')">${bdSalleName(i)}</button>`;
+            }
+            filt+=`<button class="bd-chip${st.todo?' active':''}" onclick="boardToggleTodo('${ph}')">⏳ À jouer seulement</button><span style="margin-left:auto;font-size:12px;color:var(--muted)">${totalDone} / ${list.length} matchs saisis</span></div>`;
+            let ms=list.filter(m=>bdTourOf(m)===st.tour);
+            if(st.salle!=='all') ms=ms.filter(m=>String(bdSalleOf(m))===st.salle);
+            if(st.todo) ms=ms.filter(m=>!isPlayed(m));
+            ms.sort((a,b)=>(bdSalleOf(a)-bdSalleOf(b))||((a.terrain||0)-(b.terrain||0)));
+            let body='';
+            if(!ms.length) body='<div style="color:var(--muted);padding:14px 0;font-size:13px">Aucun match pour ce filtre.</div>';
+            else if(nbSalles>1&&st.salle==='all'){
+                const by={}; ms.forEach(m=>{ (by[bdSalleOf(m)]=by[bdSalleOf(m)]||[]).push(m); });
+                body=Object.keys(by).map(k=>`<div class="bd-salle">${bdSalleName(+k)}</div><div class="bd-grid">${by[k].map(m=>bdCard(ph,m)).join('')}</div>`).join('');
+            } else body=`<div class="bd-grid">${ms.map(m=>bdCard(ph,m)).join('')}</div>`;
+            const ttl=ph==='P1'?'🏓 Matchs Phase 1':ph==='P2'?'🏓 Matchs Phase 2':'🏆 Matchs de classement';
+            return `<div class="panel"><div class="panel-header">${ttl}</div><div class="panel-body"><div class="rtabs">${tabs}</div>${filt}${body}</div></div>`;
+        }
+        const bdRerender=ph=>{ if(ph==='P1') renderPhase1UI(); else if(ph==='P2') renderPhase2UI(); else renderFinalesUI(); };
+        window.boardSetTour=function(ph,t){ BOARD[ph].tour=t; bdRerender(ph); };
+        window.boardSetSalle=function(ph,s){ BOARD[ph].salle=s; bdRerender(ph); };
+        window.boardToggleTodo=function(ph){ BOARD[ph].todo=!BOARD[ph].todo; bdRerender(ph); };
+        let _bdTimer=null;
+        function bdFind(ph,id){ return bdList(ph).find(x=>x.id===+id); }
+        function bdCommit(ph,focus){
+            clearTimeout(_bdTimer);
+            const act=focus||(document.activeElement&&document.activeElement.classList&&document.activeElement.classList.contains('sinp')?{ph:document.activeElement.dataset.ph,id:document.activeElement.dataset.id,side:document.activeElement.dataset.side}:null);
+            if(ph==='P1'){ renderRankingP1(); if(matchesP2.length) renderPhase2UI(); }
+            else if(ph==='P2'){ renderRankingP2(); }
+            updateGlobalRanking(); renderSchedule(); updateCounters(); updateTopRecap(); saveData();
+            bdRerender(ph);
+            if(act){ const el=document.querySelector(`.sinp[data-ph="${act.ph}"][data-id="${act.id}"][data-side="${act.side}"]`); if(el){ el.focus(); try{ el.setSelectionRange(el.value.length,el.value.length); }catch(e){} } }
+        }
+        document.addEventListener('input',e=>{
+            const el=e.target; if(!el.classList||!el.classList.contains('sinp')||!bdCan()) return;
+            const ph=el.dataset.ph, m=bdFind(ph,el.dataset.id); if(!m) return;
+            const raw=el.value.replace(/[^0-9]/g,'').slice(0,2); el.value=raw;
+            if(el.dataset.side==='1') m.score1=raw; else m.score2=raw;
+            const card=el.closest('.mc2'); if(card){
+                const ins=card.querySelectorAll('.sinp'), a=ins[0].value===''?null:+ins[0].value, b=ins[1].value===''?null:+ins[1].value;
+                const both=a!==null&&b!==null; card.classList.toggle('done-mc',both);
+                ins[0].classList.toggle('win-s',both&&a>b); ins[1].classList.toggle('win-s',both&&b>a);
+                const stt=card.querySelector('.mc2-state'); if(stt){ stt.textContent=both?'✓ Terminé':'À jouer'; stt.className='mc2-state '+(both?'ok':'todo'); }
+            }
+            clearTimeout(_bdTimer); _bdTimer=setTimeout(()=>bdCommit(ph),800);
+        });
+        document.addEventListener('focusin',e=>{ const el=e.target; if(el.classList&&el.classList.contains('sinp')&&!el.readOnly){ setTimeout(()=>{ try{ el.select(); }catch(x){} },0); } });
+        document.addEventListener('keydown',e=>{
+            const el=e.target; if(!el.classList||!el.classList.contains('sinp')||e.key!=='Enter') return;
+            e.preventDefault();
+            const all=[...document.querySelectorAll('.sinp:not([readonly])')], nx=all[all.indexOf(el)+1];
+            bdCommit(el.dataset.ph, nx?{ph:nx.dataset.ph,id:nx.dataset.id,side:nx.dataset.side}:null);
+        });
+        document.addEventListener('change',e=>{
+            const el=e.target; if(!el.classList||!isAdmin) return;
+            if(el.classList.contains('bd-terrain')){ const m=bdFind(el.dataset.ph,el.dataset.id); if(m){ m.terrain=parseInt(el.value); saveData(); renderSchedule(); bdRerender(el.dataset.ph); } }
+            else if(el.classList.contains('bd-time')){ const m=bdFind(el.dataset.ph,el.dataset.id); if(m){ m.startTime=el.value; saveData(); renderSchedule(); bdRerender(el.dataset.ph); } }
+        });
+
+        // ── Pavé numérique mobile ──
+        let _np={ph:'P1',id:0,team:'A',valA:'',valB:''};
+        window.openNumpad=function(ph,id){
+            if(!bdCan()) return; const m=bdFind(ph,id); if(!m) return;
+            _np={ph,id,team:'A',valA:m.score1!==undefined&&m.score1!==null&&m.score1!==''?String(m.score1):'',valB:m.score2!==undefined&&m.score2!==null&&m.score2!==''?String(m.score2):''};
+            document.getElementById('numpadTeamA').textContent=m.team1?m.team1.club:'?'; document.getElementById('numpadTeamB').textContent=m.team2?m.team2.club:'?';
+            document.getElementById('numpadLabel').textContent=(m.startTime?m.startTime+' · ':'')+'Terrain '+(m.terrain||'–');
+            numpadSelectTeam('A'); numpadRefresh(); document.getElementById('numpadOverlay').style.display='flex';
+        };
+        window.closeNumpad=function(){ document.getElementById('numpadOverlay').style.display='none'; };
+        window.numpadSelectTeam=function(t){
+            _np.team=t;
+            const on='border:2px solid var(--grn);background:var(--grn);color:#fff', off='border:2px solid var(--bdr2);background:var(--s2);color:var(--muted)';
+            document.getElementById('numpadBtnA').style.cssText=(t==='A'?on:off)+';flex:1;padding:8px;border-radius:8px;font-family:Oswald,sans-serif;font-size:13px;cursor:pointer';
+            document.getElementById('numpadBtnB').style.cssText=(t==='B'?on:off)+';flex:1;padding:8px;border-radius:8px;font-family:Oswald,sans-serif;font-size:13px;cursor:pointer';
+        };
+        window.numpadPress=function(d){ const k=_np.team==='A'?'valA':'valB'; _np[k]=(_np[k].length>=2)?String(d):_np[k]+String(d); numpadRefresh(); };
+        window.numpadDel=function(){ const k=_np.team==='A'?'valA':'valB'; _np[k]=_np[k].slice(0,-1); numpadRefresh(); };
+        function numpadRefresh(){
+            const a=document.getElementById('numpadValA'), b=document.getElementById('numpadValB');
+            a.textContent=_np.valA===''?'–':_np.valA; b.textContent=_np.valB===''?'–':_np.valB;
+            const ga=_np.valA===''?null:+_np.valA, gb=_np.valB===''?null:+_np.valB;
+            if(ga!==null&&gb!==null){ a.style.color=ga>gb?'var(--grn)':ga<gb?'var(--red)':'var(--ylw)'; b.style.color=gb>ga?'var(--grn)':gb<ga?'var(--red)':'var(--ylw)'; }
+            else { a.style.color='var(--ink2)'; b.style.color='var(--ink2)'; }
+        }
+        window.numpadConfirm=function(){
+            const m=bdFind(_np.ph,_np.id); if(!m){ closeNumpad(); return; }
+            m.score1=_np.valA; m.score2=_np.valB; closeNumpad(); bdCommit(_np.ph,null);
+        };
+
+
+        // ============ OUVERTURE DU LIVE (comme l'appli RSTH) ============
+        // flex/status {liveOpen} est lisible par tous ; flex/current n'est lisible par un spectateur que si liveOpen = true
+        // (règle Firestore). Le staff (admin / scorer) voit toujours le tournoi.
+        let LIVE_OPEN=false, unsubLiveStatus=null;
+        const staffNow=()=>isAdmin||isSaisie;
+        function stopRealtimeSync(){ if(unsubscribeSnapshot){ unsubscribeSnapshot(); unsubscribeSnapshot=null; } }
+        function showLiveClosed(){ const o=document.getElementById('liveClosedOverlay'); if(o) o.style.display='flex'; }
+        function hideLiveClosed(){ const o=document.getElementById('liveClosedOverlay'); if(o) o.style.display='none'; }
+        window.__liveBlocked=()=>!staffNow()&&!LIVE_OPEN;
+        function updateLiveUI(){
+            document.querySelectorAll('.live-toggle').forEach(b=>{ b.textContent=LIVE_OPEN?'🟢 Live ouvert':'🔴 Live fermé'; b.classList.toggle('live-on',LIVE_OPEN); });
+            const chip=document.getElementById('liveStatusChip');
+            if(chip){ chip.textContent=LIVE_OPEN?'🟢 Live ouvert':'🔴 Live pas encore ouvert'; chip.className='live-chip '+(LIVE_OPEN?'on':'off'); }
+        }
+        function handleLive(open){
+            const was=LIVE_OPEN; LIVE_OPEN=open; updateLiveUI();
+            if(staffNow()) return;
+            if(open){ hideLiveClosed(); if(!unsubscribeSnapshot) startRealtimeSync(); }
+            else if(was||unsubscribeSnapshot){ stopRealtimeSync(); if(window._specEntered) showLiveClosed(); }
+        }
+        function watchLiveStatus(){
+            if(unsubLiveStatus||!db) return;
+            unsubLiveStatus=onSnapshot(doc(db,'flex','status'),snap=>handleLive(snap.exists()&&snap.data().liveOpen===true),()=>handleLive(false));
+        }
+        function gatedStart(){
+            watchLiveStatus();
+            if(staffNow()||LIVE_OPEN){ hideLiveClosed(); startRealtimeSync(); }
+            else { stopRealtimeSync(); if(window._specEntered) showLiveClosed(); }
+            updateLiveUI();
+        }
+        window.toggleLiveOpen=async function(){
+            if(!isAdmin) return;
+            const nv=!LIVE_OPEN;
+            try{
+                if(nv){                                   // ouverture : d'abord le document (lecture autorisée), puis le drapeau public
+                    await setDoc(doc(db,'flex','current'),{liveOpen:true},{merge:true});
+                    await setDoc(doc(db,'flex','status'),{liveOpen:true,updatedAt:serverTimestamp()},{merge:true});
+                } else {                                  // fermeture : d'abord le drapeau public, puis le document
+                    await setDoc(doc(db,'flex','status'),{liveOpen:false,updatedAt:serverTimestamp()},{merge:true});
+                    await setDoc(doc(db,'flex','current'),{liveOpen:false},{merge:true});
+                }
+                LIVE_OPEN=nv; updateLiveUI(); showMsg(nv?'🟢 Live ouvert : les spectateurs voient le tournoi':'🔴 Live fermé : les spectateurs sont bloqués');
+            }catch(e){ console.error(e); showMsg('⚠️ Impossible de changer le live : '+e.message); }
+        };
+
         // Exposer
         window.switchTab=function(tabId){ document.querySelectorAll('.tab').forEach(btn=>{ if(btn.dataset.tab===tabId) btn.click(); }); };
         window.toggleLoginPanel=toggleLoginPanel;
         window.logout=logout;
         window.loginWithGoogle=loginWithGoogle;
         window.loginWithEmail=loginWithEmail;
-        window.addUser=addUser;
-        window.removeUser=removeUser;
     </script>
 
     <style>
@@ -2702,7 +3254,7 @@ window._smNav=function(idx){ _smSectionIdx=idx; renderScoreModal(); };
         .btn-default{ background:var(--surface2); color:var(--text-muted); border:1px solid var(--border); }
         .btn-default:hover{ border-color:var(--accent); color:var(--accent); }
         .readonly-mode input:not(#loginEmail):not(#loginPassword),
-        .readonly-mode .container button:not(.tab):not(.float-btn) { opacity:0.6; pointer-events:none; }
+        .readonly-mode .container button:not(.tab):not(.float-btn):not(.pb-btn) { opacity:0.6; pointer-events:none; }
         
         /* Saisie : peut entrer scores mais pas configurer */
         .saisie-mode .btn-primary,.saisie-mode .btn-warning,.saisie-mode .btn-danger{ opacity:0.35; pointer-events:none; }
@@ -2784,7 +3336,7 @@ window._smNav=function(idx){ _smSectionIdx=idx; renderScoreModal(); };
             .schedule-matches{ display:flex !important; }
         }
     </style>
-<!-- Application flexible : 32/36/40/44/48 équipes ; données isolées dans tournoi/data_flexible -->
+<!-- Application flexible : 32/36/40/44/48 équipes ; données dans flex/current (projet tournoi-de-pickleball-flexible) -->
 
 <style id="rsth-skin">
 /* ═══ Peau RSTH : mêmes jetons, polices et composants que l'appli Tournoi Pickleball RSTH interclubs ═══ */
@@ -3021,6 +3573,98 @@ body.tv-mode .hdr-drawer-overlay{ display:none!important; }
 .tv-clone{ background:var(--s0); color:var(--ink); border-radius:14px; padding:18px; zoom:1.15; pointer-events:none; }
 .tv-clone .panel{ margin-bottom:12px; }
 </style>
+<style id="rsth-skin-print">
+.print-bar .pb-ttl{ font-family:'Oswald',sans-serif;letter-spacing:1px;color:var(--ink2);margin-right:4px; }
+#printModal{ display:none;position:fixed;inset:0;z-index:20000;background:rgba(15,26,48,.62);overflow:auto;padding:16px; }
+#printModal.open{ display:block; }
+.pm-box{ background:#fff;color:#111;max-width:920px;margin:0 auto;border-radius:10px;padding:14px 18px 24px; }
+.pm-bar{ display:flex;justify-content:space-between;align-items:center;gap:8px;position:sticky;top:-14px;background:#fff;padding:8px 0 10px;border-bottom:2px solid var(--bdr);margin-bottom:12px;z-index:2; }
+.pm-doc{ font-family:'Exo 2',Arial,sans-serif;font-size:12px;color:#111;-webkit-print-color-adjust:exact;print-color-adjust:exact; }
+.pm-doc h1{ font-family:'Oswald',Arial,sans-serif;font-size:20px;letter-spacing:1px;margin:0 0 2px; }
+.pm-doc h2{ font-family:'Oswald',Arial,sans-serif;font-size:15px;letter-spacing:.8px;margin:16px 0 6px;border-bottom:2px solid #1a7a3a;padding-bottom:3px; }
+.pm-doc .sub{ color:#555;font-size:11px;margin-bottom:8px; }
+.pm-doc table.pt{ width:100%;border-collapse:collapse;margin-bottom:10px; }
+.pm-doc table.pt th{ background:#e8edf8;border:1px solid #9aa7c4;padding:5px 6px;font-size:10px;text-transform:uppercase;letter-spacing:.5px;text-align:left; }
+.pm-doc table.pt td{ border:1px solid #b8c2d8;padding:5px 6px;vertical-align:middle; }
+.pm-doc table.pt tr.newslot td{ border-top:2px solid #1a7a3a; }
+.pm-doc .sc{ display:inline-block;min-width:52px;height:20px;border-bottom:1px solid #444;text-align:center;font-family:'Oswald',Arial,sans-serif;font-size:14px; }
+.pm-doc .slip{ border:2px solid #1a2540;border-radius:8px;padding:10px 14px;margin-bottom:14px;page-break-inside:avoid;break-inside:avoid; }
+.pm-doc .slip .tn{ font-family:'Oswald',Arial,sans-serif;font-size:22px;letter-spacing:1px;line-height:1.1; }
+.pm-doc .slip .pl{ color:#444;font-size:12px;margin:2px 0 6px; }
+.pm-doc .slip .pool{ font-size:11px;color:#333;margin-bottom:6px; }
+.pm-doc .slip-sep{ page-break-after:always;break-after:page; }
+.pm-doc .panel{ box-shadow:none;border:1px solid #b8c2d8;margin-bottom:10px;break-inside:avoid; }
+.pm-doc .match-row, .pm-doc input, .pm-doc button{ display:none!important; }
+@media print{
+  body.print-open > *:not(#printModal){ display:none!important; }
+  body.print-open{ background:#fff!important; }
+  body.print-open #printModal{ position:static;display:block;background:none;padding:0;overflow:visible; }
+  body.print-open .pm-box{ max-width:none;padding:0;border-radius:0; }
+  body.print-open .pm-bar{ display:none!important; }
+  @page{ size:A4 portrait;margin:10mm; }
+}
+</style>
+<style id="rsth-skin-board">
+.round-block{ margin-bottom:14px;border:1.5px solid var(--bdr);border-radius:var(--r);overflow:hidden; }
+.round-hdr{ background:var(--s2);padding:10px 16px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--bdr);flex-wrap:wrap; }
+.round-hdr-ttl{ font-family:'Oswald',sans-serif;font-size:16px;letter-spacing:1px;color:var(--ink2); }
+.round-time-badge{ background:var(--blu-bg);color:var(--blu);border:1px solid rgba(26,114,212,.3);border-radius:20px;padding:2px 10px;font-size:11px;font-weight:700;font-family:'Oswald',sans-serif; }
+.rtabs{ display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px; }
+.rtab{ padding:6px 14px;border-radius:6px;border:1.5px solid var(--bdr);background:var(--s2);font-family:'Oswald',sans-serif;font-size:14px;cursor:pointer;color:var(--muted);transition:all .15s;display:flex;flex-direction:column;align-items:center;gap:2px; }
+.rtab:hover{ border-color:var(--grn);color:var(--grn); }
+.rtab.active{ background:var(--grn);border-color:var(--grn);color:#fff; }
+.rtab.done{ background:var(--grn-bg);border-color:var(--grn);color:var(--grn); }
+.rtab.done.active{ background:var(--grn);color:#fff; }
+.rtab-time{ font-size:10px;opacity:.7;font-family:'Exo 2',sans-serif;font-weight:400; }
+.mc{ background:var(--s1);border:1.5px solid var(--bdr);border-radius:var(--r);padding:14px 16px;margin-bottom:8px;display:grid;grid-template-columns:1fr 56px 28px 56px 1fr;align-items:center;gap:8px;transition:all .15s; }
+.mc:hover{ border-color:var(--grn);box-shadow:0 2px 10px rgba(30,140,69,.1); }
+.mc.done-mc{ background:var(--grn-bg);border-color:rgba(30,140,69,.3); }
+.sinp{ width:62px;height:52px;text-align:center;font-family:'Oswald',sans-serif;font-weight:700;font-size:26px;background:var(--s2);border:2px solid var(--bdr);border-radius:10px;color:var(--ink);outline:none;transition:border-color .15s,box-shadow .15s;padding:0; }
+.sinp:focus{ border-color:var(--blu);box-shadow:0 0 0 3px rgba(80,140,255,.18);background:var(--s1); }
+.sinp.win-s{ border-color:var(--grn);color:var(--grn);background:var(--grn-bg); }
+.sinp::placeholder{ color:var(--dim);font-size:20px; }
+.bd-filters{ display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:12px; }
+.bd-chip{ padding:4px 12px;border-radius:20px;border:1.5px solid var(--bdr);background:var(--s2);font-size:12px;font-weight:600;color:var(--muted);cursor:pointer;font-family:'Exo 2',sans-serif; }
+.bd-chip.active{ background:var(--blu-bg);border-color:var(--blu);color:var(--blu); }
+.bd-salle{ font-family:'Oswald',sans-serif;letter-spacing:1.5px;font-size:13px;color:var(--ink2);margin:12px 0 6px;border-left:3px solid var(--blu);padding-left:8px; }
+.bd-grid{ display:grid;grid-template-columns:repeat(auto-fill,minmax(400px,1fr));gap:10px; }
+.mc2{ background:var(--s1);border:1.5px solid var(--bdr);border-radius:var(--r);padding:10px 12px;transition:all .15s; }
+.mc2:hover{ border-color:var(--grn);box-shadow:0 2px 10px rgba(30,140,69,.1); }
+.mc2.done-mc{ background:var(--grn-bg);border-color:rgba(30,140,69,.3); }
+.mc2-top{ display:flex;gap:6px;align-items:center;flex-wrap:wrap;font-size:11px;color:var(--muted);margin-bottom:8px; }
+.mc2-court{ background:var(--ink2);color:#fff;font-family:'Oswald',sans-serif;padding:2px 10px;border-radius:6px;font-size:13px;letter-spacing:.8px; }
+.mc2-time{ background:var(--blu-bg);color:var(--blu);border:1px solid rgba(21,96,192,.3);border-radius:20px;padding:1px 9px;font-family:'Oswald',sans-serif;font-size:12px; }
+.mc2-state{ margin-left:auto;font-weight:700; }
+.mc2-state.ok{ color:var(--grn); } .mc2-state.todo{ color:var(--ylw); }
+.mc2-row{ display:grid;grid-template-columns:1fr auto 14px auto 1fr;gap:6px;align-items:center; }
+.mc2-team{ font-family:'Oswald',sans-serif;font-size:15px;letter-spacing:.3px;color:var(--ink2);line-height:1.15;min-width:0; }
+.mc2-team small{ display:block;font-family:'Exo 2',sans-serif;font-size:10px;color:var(--muted);letter-spacing:0;margin-top:2px; }
+.mc2-team.b{ text-align:right; }
+.mc2 .sinp{ width:52px;height:46px;font-size:22px; }
+.mc2-sep{ text-align:center;color:var(--dim);font-family:'Oswald',sans-serif; }
+.mc2-foot{ display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap; }
+.mc2-adm{ display:flex;gap:6px;align-items:center;font-size:11px;color:var(--muted); }
+.mc2-adm select,.mc2-adm input{ padding:3px 6px;font-size:12px;width:auto; }
+.np-open{ margin-left:auto;padding:5px 12px;border-radius:8px;border:1.5px solid var(--bdr2);background:var(--s2);font-family:'Oswald',sans-serif;font-size:13px;letter-spacing:.5px;cursor:pointer;color:var(--ink2); }
+.numpad-key{ padding:16px;font-family:'Oswald',sans-serif;font-size:24px;border-radius:10px;border:1.5px solid var(--bdr);background:var(--s2);color:var(--ink);cursor:pointer; }
+.numpad-key:active{ background:var(--s3); }
+.numpad-del{ color:var(--red); } .numpad-ok{ background:var(--grn);border-color:var(--grn);color:#fff; }
+#numpadBtnA,#numpadBtnB{ flex:1;padding:8px;border-radius:8px;font-family:'Oswald',sans-serif;font-size:13px;cursor:pointer; }
+body:not(.readonly-mode) #numpadOverlay{ }
+.readonly-mode .np-open{ display:none; }
+@media (max-width:560px){ .bd-grid{ grid-template-columns:1fr; } .mc2 .sinp{ width:48px; } }
+</style>
+<style id="rsth-skin-live">
+.live-chip{ display:inline-block;padding:3px 14px;border-radius:20px;font-family:'Oswald',sans-serif;font-size:12px;letter-spacing:.8px;font-weight:600; }
+.live-chip.on{ background:#e3f6ea;color:#145c2c;border:1px solid #a0d4b0; }
+.live-chip.off{ background:#fdeaea;color:#b02018;border:1px solid #e6a8a4; }
+.live-toggle{ font-family:'Oswald',sans-serif;letter-spacing:.6px; }
+.hdr-btn.live-toggle{ background:#fdeaea;color:#b02018;border-color:#e6a8a4; }
+.hdr-btn.live-toggle.live-on{ background:#e3f6ea;color:#145c2c;border-color:#7cc596; }
+.hdr-drawer-btn.live-toggle{ color:#b02018; } .hdr-drawer-btn.live-toggle.live-on{ color:#145c2c; }
+.btn.live-toggle{ background:#fdeaea;color:#b02018;border:1px solid #e6a8a4; }
+.btn.live-toggle.live-on{ background:#e3f6ea;color:#145c2c;border-color:#7cc596; }
+</style>
 <style id="rsth-skin2">
 /* ── Messages / chrono / parcours (repris de l'appli RSTH) ── */
 .p-lvl{ color:var(--ylw);font-size:11px;font-weight:700;min-width:60px; }
@@ -3080,7 +3724,8 @@ body.tv-mode .app-msg-banner{ display:none!important; }
     <!-- ZONE SPECTATEURS -->
     <div style="background:linear-gradient(135deg,#eaf2fd,#dbe8fa);border-radius:14px;padding:18px 16px;margin-bottom:18px;border:2px solid rgba(100,150,220,.35)">
       <div style="font-family:'Oswald',sans-serif;font-size:22px;font-weight:700;letter-spacing:1.5px;color:#1a4a7a;text-align:center;margin-bottom:4px;text-transform:uppercase">👁 Accès Spectateur</div>
-      <div style="font-size:12px;color:#3a5a80;text-align:center;margin-bottom:14px">Suivez le tournoi en temps réel — sans inscription</div>
+      <div style="font-size:12px;color:#3a5a80;text-align:center;margin-bottom:8px">Suivez le tournoi en temps réel — sans inscription</div>
+      <div style="text-align:center;margin-bottom:12px"><span id="liveStatusChip" class="live-chip off">🔴 Live pas encore ouvert</span></div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
         <button onclick="enterSpectator('phase1')" style="padding:16px 8px;background:linear-gradient(135deg,#5b9bd8,#3f7fc4);border:2px solid #7ab0e8;border-radius:10px;color:#fff;font-family:'Oswald',sans-serif;font-size:18px;letter-spacing:.8px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px">🏐 MATCHS</button>
         <button onclick="enterSpectator('ranking')" style="padding:16px 8px;background:linear-gradient(135deg,#e0a840,#c88f28);border:2px solid #e8c070;border-radius:10px;color:#fff;font-family:'Oswald',sans-serif;font-size:18px;letter-spacing:.8px;cursor:pointer">🏆 CLASSEMENT</button>
@@ -3117,8 +3762,10 @@ body.tv-mode .app-msg-banner{ display:none!important; }
   <div class="hdr-r" id="hdrDesktopBtns">
     <button class="hdr-btn" onclick="switchTab('reglement')">📋 Règlement</button>
     <button class="hdr-btn" onclick="openTV()">📺 Écran</button>
+    <button class="hdr-btn only-admin live-toggle" onclick="toggleLiveOpen()">🔴 Live fermé</button>
     <button class="hdr-btn only-admin" onclick="switchTab('users')">👑 Admin</button>
     <button class="hdr-btn only-visitor" id="adminLoginBtn" onclick="toggleLoginPanel()">🔑 Staff</button>
+    <button class="hdr-btn only-staff" id="clubExtraBtn" style="display:none" onclick="openClubFromApp()">🏟️ Mon club</button>
     <button class="hdr-btn only-staff" onclick="openMessagesModal()">📢 Messages</button>
     <button class="hdr-btn only-staff" id="logoutBtn" style="display:none">Quitter</button>
   </div>
@@ -3128,8 +3775,10 @@ body.tv-mode .app-msg-banner{ display:none!important; }
 <div class="hdr-drawer" id="mobileDrawer">
   <button class="hdr-drawer-btn" onclick="closeMobileMenu();switchTab('reglement')">📋&nbsp; Règlement</button>
   <button class="hdr-drawer-btn" onclick="closeMobileMenu();openTV()">📺&nbsp; Écran</button>
+  <button class="hdr-drawer-btn only-admin live-toggle" onclick="closeMobileMenu();toggleLiveOpen()">🔴 Live fermé</button>
   <button class="hdr-drawer-btn only-admin" onclick="closeMobileMenu();switchTab('users')">👑&nbsp; Admin</button>
   <button class="hdr-drawer-btn only-visitor" onclick="closeMobileMenu();toggleLoginPanel()">🔑&nbsp; Connexion Staff</button>
+  <button class="hdr-drawer-btn only-staff" id="drawerClubExtraBtn" style="display:none" onclick="closeMobileMenu();openClubFromApp()">🏟️&nbsp; Mon club</button>
   <button class="hdr-drawer-btn only-staff" onclick="closeMobileMenu();openMessagesModal()">📢&nbsp; Messages</button>
   <div class="hdr-drawer-sep only-staff"></div>
   <button class="hdr-drawer-btn drawer-danger only-staff" onclick="closeMobileMenu();logout()">⏻&nbsp; Quitter</button>
@@ -3182,7 +3831,7 @@ body.tv-mode .app-msg-banner{ display:none!important; }
         <button class="tab" data-tab="schedule">📅 Programme</button>
         <button class="tab" data-tab="planning">🗓️ Planning</button>
         <button class="tab" data-tab="reglement">📖 Règlement</button>
-        <button class="tab" data-tab="users" id="usersTabBtn" style="display:none;">👥 Utilisateurs</button>
+        <button class="tab" data-tab="users" id="usersTabBtn" style="display:none;">👑 Administration</button>
     </div>
 
     <div id="stepHint" class="info info-b" style="display:none;margin-bottom:14px"></div>
@@ -3276,24 +3925,36 @@ body.tv-mode .app-msg-banner{ display:none!important; }
     </div>
 
     <!-- PHASES -->
-    <div id="phase1Tab" class="tab-content"><div id="phase1Area"></div></div>
-    <div id="rankingP1Tab" class="tab-content"><div id="rankingP1Area"></div></div>
+    <div id="phase1Tab" class="tab-content">
+        <div class="panel print-bar"><div class="panel-body" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px 16px"><span class="pb-ttl">🖨️ Imprimer</span><button class="btn btn-ghost btn-sm pb-btn" onclick="printProgram('P1')">📋 Programme P1</button><button class="btn btn-ghost btn-sm pb-btn" onclick="printTeamSlips('P1')">🗂️ Fiches équipes P1</button></div></div>
+        <div id="phase1Area"></div></div>
+    <div id="rankingP1Tab" class="tab-content">
+        <div class="panel print-bar"><div class="panel-body" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px 16px"><span class="pb-ttl">🖨️ Imprimer</span><button class="btn btn-ghost btn-sm pb-btn" onclick="printRanking('P1')">📊 Classement P1</button></div></div>
+        <div id="rankingP1Area"></div></div>
     <div id="phase2Tab" class="tab-content">
         <div class="panel"><div class="panel-body"><div class="step-actions">
             <button class="btn btn-warning" id="genP2Btn">🏅 Générer matchs P2</button>
             <span style="font-size:12px;color:var(--muted)">À lancer quand tous les matchs de la Phase 1 sont saisis.</span>
         </div></div></div>
+        <div class="panel print-bar"><div class="panel-body" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px 16px"><span class="pb-ttl">🖨️ Imprimer</span><button class="btn btn-ghost btn-sm pb-btn" onclick="printProgram('P2')">📋 Programme P2</button><button class="btn btn-ghost btn-sm pb-btn" onclick="printTeamSlips('P2')">🗂️ Fiches équipes P2</button></div></div>
         <div id="phase2Area"></div>
     </div>
-    <div id="rankingP2Tab" class="tab-content"><div id="rankingP2Area"></div></div>
+    <div id="rankingP2Tab" class="tab-content">
+        <div class="panel print-bar"><div class="panel-body" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px 16px"><span class="pb-ttl">🖨️ Imprimer</span><button class="btn btn-ghost btn-sm pb-btn" onclick="printRanking('P2')">📊 Classement P2</button></div></div>
+        <div id="rankingP2Area"></div></div>
     <div id="finalesTab" class="tab-content">
         <div class="panel"><div class="panel-body"><div class="step-actions">
             <button class="btn btn-warning" id="genFinalesBtn">🏆 Générer matchs de classement</button>
             <span style="font-size:12px;color:var(--muted)">À lancer quand tous les matchs de la Phase 2 sont saisis.</span>
         </div></div></div>
+        <div class="panel print-bar"><div class="panel-body" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px 16px"><span class="pb-ttl">🖨️ Imprimer</span><button class="btn btn-ghost btn-sm pb-btn" onclick="printProgram('FIN')">📋 Programme classement</button></div></div>
         <div id="finalesArea"><div class="panel"><div class="panel-body" style="color:var(--text-muted);">Générez la Phase 2 puis cliquez sur "Générer matchs classement" dans Config.</div></div></div></div>
-    <div id="rankingTab" class="tab-content"><div id="rankingArea"></div></div>
-    <div id="scheduleTab" class="tab-content"><div id="scheduleArea"></div></div>
+    <div id="rankingTab" class="tab-content">
+        <div class="panel print-bar"><div class="panel-body" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px 16px"><span class="pb-ttl">🖨️ Imprimer</span><button class="btn btn-ghost btn-sm pb-btn" onclick="printRanking('FINAL')">🏆 Classement final</button><button class="btn btn-ghost btn-sm pb-btn" onclick="printProgram('ALL')">📋 Programme complet</button></div></div>
+        <div id="rankingArea"></div></div>
+    <div id="scheduleTab" class="tab-content">
+        <div class="panel print-bar"><div class="panel-body" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px 16px"><span class="pb-ttl">🖨️ Imprimer</span><button class="btn btn-ghost btn-sm pb-btn" onclick="printProgram('P1')">📋 Programme P1</button><button class="btn btn-ghost btn-sm pb-btn" onclick="printProgram('P2')">📋 Programme P2</button><button class="btn btn-ghost btn-sm pb-btn" onclick="printProgram('FIN')">📋 Classement</button><button class="btn btn-ghost btn-sm pb-btn" onclick="printProgram('ALL')">📋 Tout le tournoi</button></div></div>
+        <div id="scheduleArea"></div></div>
     <div id="planningTab" class="tab-content">
         <div class="panel">
             <div class="panel-header">📋 Matchs & horaires Phase 1</div>
@@ -3306,6 +3967,7 @@ body.tv-mode .app-msg-banner{ display:none!important; }
                 <div id="horairesInfo" style="font-size:12px;color:var(--grn);padding:6px 0 0;display:none;"></div>
             </div>
         </div>
+        <div class="panel print-bar"><div class="panel-body" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px 16px"><span class="pb-ttl">🖨️ Imprimer</span><button class="btn btn-ghost btn-sm pb-btn" onclick="printProgram('P1')">📋 Programme P1</button><button class="btn btn-ghost btn-sm pb-btn" onclick="printTeamSlips('P1')">🗂️ Toutes les fiches P1</button><select id="printTeamSel" style="padding:6px 8px;border-radius:8px;max-width:210px"></select><button class="btn btn-ghost btn-sm pb-btn" onclick="printOneSlip()">🖨️ Fiche de cette équipe</button></div></div>
         <div id="planningArea"></div>
     </div>
     <div id="reglementTab" class="tab-content"><div id="reglementArea"></div></div>
@@ -3313,25 +3975,112 @@ body.tv-mode .app-msg-banner{ display:none!important; }
     <!-- UTILISATEURS -->
     <div id="usersTab" class="tab-content">
         <div class="panel">
-            <div class="panel-header">👥 Gestion des accès</div>
+            <div class="panel-header">📡 Live spectateurs</div>
             <div class="panel-body">
-                <div style="background:var(--bg);border-radius:10px;padding:14px;margin-bottom:18px;">
-                    <div style="font-weight:600;font-size:0.8rem;margin-bottom:10px;">➕ Ajouter un utilisateur</div>
-                    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
-                        <div style="flex:1;min-width:150px;"><label style="font-size:0.7rem;color:var(--text-muted);">Email</label><input id="newUserEmail" type="email" placeholder="prenom@email.com" style="width:100%;padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:0.78rem;box-sizing:border-box;font-family:'Exo 2',sans-serif;margin-top:3px;"></div>
-                        <div style="flex:1;min-width:130px;"><label style="font-size:0.7rem;color:var(--text-muted);">Mot de passe</label><input id="newUserPassword" type="password" placeholder="Min. 6 caractères" style="width:100%;padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:0.78rem;box-sizing:border-box;font-family:'Exo 2',sans-serif;margin-top:3px;"></div>
-                        <div style="flex:1;min-width:120px;"><label style="font-size:0.7rem;color:var(--text-muted);">Nom (optionnel)</label><input id="newUserName" type="text" placeholder="Jean Dupont" style="width:100%;padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:0.78rem;box-sizing:border-box;font-family:'Exo 2',sans-serif;margin-top:3px;"></div>
-                        <button onclick="addUser()" style="padding:9px 16px;border-radius:8px;border:none;background:var(--accent);color:#fff;cursor:pointer;font-size:0.78rem;font-weight:600;font-family:'Exo 2',sans-serif;">✅ Ajouter</button>
-                    </div>
-                    <div id="addUserMsg" style="margin-top:8px;font-size:0.72rem;text-align:center;min-height:16px;"></div>
+                <div class="step-actions"><button class="btn btn-ghost live-toggle" onclick="toggleLiveOpen()">🔴 Live fermé</button></div>
+                <div style="font-size:12px;color:var(--muted);margin-top:8px">Tant que le live est fermé, les spectateurs voient un écran d'attente et ne peuvent pas lire le tournoi. Le staff (admin, scorer) voit toujours tout. Ouvrez le live quand les équipes et le planning sont prêts.</div>
+            </div>
+        </div>
+        <div class="panel">
+            <div class="panel-header">📥 Inscriptions d'équipes en attente</div>
+            <div class="panel-body">
+                <div id="pendingRegCap" style="font-size:12px;margin-bottom:10px;color:var(--muted)"></div>
+                <div class="step-actions" style="margin-bottom:10px"><button class="btn btn-primary btn-sm" id="regValidateAllBtn" style="display:none" onclick="approveAllPending()">✓ Tout valider (dans la limite des places)</button></div>
+                <div id="pendingRegList"></div>
+                <div style="font-size:12px;color:var(--muted);margin-top:8px">Les équipes validées remplissent les places libres de l'étape Équipes. À faire avant le tirage P1.</div>
+            </div>
+        </div>
+        <div class="panel">
+            <div class="panel-header">🏟️ Clubs (inscription en ligne)</div>
+            <div class="panel-body">
+                <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px">
+                    <div style="flex:1;min-width:140px"><label>Nom du club</label><input id="newC_name" type="text" placeholder="RSTH Pickleball" style="width:100%;padding:8px"></div>
+                    <div style="flex:1;min-width:150px"><label>Email</label><input id="newC_email" type="email" placeholder="club@email.com" style="width:100%;padding:8px"></div>
+                    <div style="flex:1;min-width:120px"><label>Mot de passe</label><input id="newC_pwd" type="password" placeholder="6 car. min" style="width:100%;padding:8px"></div>
+                    <div style="width:80px"><label>Équipes max</label><input id="newC_max" type="number" min="1" value="1" style="width:100%;padding:8px"></div>
+                    <button class="btn btn-primary btn-sm" onclick="adminCreateClub()">➕ Créer le club</button>
                 </div>
-                <div style="font-weight:600;font-size:0.8rem;margin-bottom:10px;">📋 Utilisateurs autorisés</div>
-                <div id="usersList"><div style="color:var(--text-muted);text-align:center;padding:20px;">Chargement...</div></div>
+                <div id="newClubMsg" style="font-size:12px;min-height:16px;margin-bottom:8px"></div>
+                <div style="overflow-x:auto"><table class="ranking-table" style="width:100%"><thead><tr><th style="text-align:left">Club</th><th style="text-align:left">Email</th><th>Équipes</th><th>Quota</th><th></th></tr></thead><tbody id="clubListBody"></tbody></table></div>
+            </div>
+        </div>
+        <div class="panel">
+            <div class="panel-header">👥 Comptes et rôles</div>
+            <div class="panel-body">
+                <div style="font-size:12px;color:var(--muted);margin-bottom:12px">Rôles : 👑 admin (tout) · ✏️ scorer (saisie des scores, chrono, messages) · 🏟️ club (inscrit ses équipes) · 👁 spectateur. Les comptes sont communs avec l'appli RSTH interclubs.</div>
+                <div style="background:var(--s2);border-radius:10px;padding:14px;margin-bottom:16px">
+                    <div style="font-weight:700;font-size:13px;margin-bottom:10px">➕ Créer un compte</div>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+                        <div style="flex:1;min-width:130px"><label>Nom</label><input id="newU_name" type="text" placeholder="Jean Dupont" style="width:100%;padding:8px"></div>
+                        <div style="flex:1;min-width:150px"><label>Email</label><input id="newU_email" type="email" placeholder="prenom@email.com" style="width:100%;padding:8px"></div>
+                        <div style="flex:1;min-width:120px"><label>Mot de passe</label><input id="newU_pwd" type="password" placeholder="6 car. min" style="width:100%;padding:8px"></div>
+                    </div>
+                    <div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:10px">
+                        <label style="display:flex;align-items:center;gap:5px"><input type="checkbox" class="newU_roleChk" value="admin" onchange="toggleNewUClubFields()"> 👑 admin</label>
+                        <label style="display:flex;align-items:center;gap:5px"><input type="checkbox" class="newU_roleChk" value="scorer" onchange="toggleNewUClubFields()"> ✏️ scorer</label>
+                        <label style="display:flex;align-items:center;gap:5px"><input type="checkbox" class="newU_roleChk" value="club" onchange="toggleNewUClubFields()"> 🏟️ club</label>
+                        <label style="display:flex;align-items:center;gap:5px"><input type="checkbox" class="newU_roleChk" value="spectator" onchange="toggleNewUClubFields()"> 👁 spectateur</label>
+                    </div>
+                    <div id="newU_clubFields" style="display:none;gap:8px;flex-wrap:wrap;margin-top:10px">
+                        <div style="flex:1;min-width:140px"><label>Nom du club</label><input id="newU_club" type="text" style="width:100%;padding:8px"></div>
+                        <div style="width:100px"><label>Équipes max</label><input id="newU_maxTeams" type="number" min="1" value="2" style="width:100%;padding:8px"></div>
+                    </div>
+                    <div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap"><button class="btn btn-primary btn-sm" onclick="adminCreateUser()">✅ Créer</button><span id="newUserMsg" style="font-size:12px"></span></div>
+                </div>
+                <div style="background:var(--s2);border-radius:10px;padding:14px;margin-bottom:16px">
+                    <div style="font-weight:700;font-size:13px;margin-bottom:10px">✏️ Modifier les rôles d'un compte</div>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+                        <div style="flex:1;min-width:200px"><label>UID (bouton ✏️ dans la liste)</label><input id="adminUidInput" type="text" style="width:100%;padding:8px"></div>
+                        <button class="btn btn-ghost btn-sm" onclick="loadUserRolesIntoForm()">Charger</button>
+                    </div>
+                    <div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:10px">
+                        <label style="display:flex;align-items:center;gap:5px"><input type="checkbox" class="chgU_roleChk" value="admin" onchange="toggleChgUClubFields()"> 👑 admin</label>
+                        <label style="display:flex;align-items:center;gap:5px"><input type="checkbox" class="chgU_roleChk" value="scorer" onchange="toggleChgUClubFields()"> ✏️ scorer</label>
+                        <label style="display:flex;align-items:center;gap:5px"><input type="checkbox" class="chgU_roleChk" value="club" onchange="toggleChgUClubFields()"> 🏟️ club</label>
+                        <label style="display:flex;align-items:center;gap:5px"><input type="checkbox" class="chgU_roleChk" value="spectator" onchange="toggleChgUClubFields()"> 👁 spectateur</label>
+                    </div>
+                    <div id="chgU_clubFields" style="display:none;gap:8px;flex-wrap:wrap;margin-top:10px">
+                        <div style="flex:1;min-width:140px"><label>Nom du club</label><input id="chgU_club" type="text" style="width:100%;padding:8px"></div>
+                        <div style="width:100px"><label>Équipes max</label><input id="chgU_maxTeams" type="number" min="1" value="2" style="width:100%;padding:8px"></div>
+                    </div>
+                    <div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap"><button class="btn btn-primary btn-sm" onclick="setUserRole()">💾 Enregistrer</button><span id="adminRoleMsg" style="font-size:12px"></span></div>
+                </div>
+                <div style="overflow-x:auto"><table class="ranking-table" style="width:100%"><thead><tr><th style="text-align:left">Nom</th><th style="text-align:left">Email</th><th>UID</th><th style="text-align:left">Rôles</th><th></th></tr></thead><tbody id="userListBody"></tbody></table></div>
             </div>
         </div>
     </div>
     <div class="step-foot" id="stepFoot" style="display:none"></div>
 </div>
+</div>
+
+
+<!-- ══ ESPACE CLUB : inscription des équipes (responsable de club) ══ -->
+<div id="clubScreen" style="display:none;min-height:100vh;background:var(--s0)">
+  <header class="hdr">
+    <div class="hdr-brand" id="clubHdrName">🏟️ Mon club</div>
+    <div style="margin-left:auto;display:flex;gap:8px">
+      <button class="hdr-btn" id="clubBackToAppBtn" style="display:none" onclick="returnToAppFromClub()">← Retour à l'appli</button>
+      <button class="hdr-btn" id="clubLogoutBtn" onclick="clubLogout()">Quitter</button>
+    </div>
+  </header>
+  <div style="max-width:640px;margin:0 auto;padding:20px 16px 60px">
+    <div class="panel">
+      <div class="panel-header">📝 Inscription de mes équipes</div>
+      <div class="panel-body">
+        <div id="clubQuota" style="font-family:'Oswald',sans-serif;font-size:18px;letter-spacing:.5px;margin-bottom:12px"></div>
+        <div id="clubAddForm" style="display:flex;flex-direction:column;gap:8px;margin-bottom:12px">
+          <input type="text" id="club_t_name" placeholder="Nom de l'équipe (ex : RSTH 1)">
+          <div style="display:flex;gap:8px"><input type="text" id="club_t_p1" placeholder="Joueur 1" style="flex:1"><input type="text" id="club_t_p2" placeholder="Joueur 2" style="flex:1"></div>
+          <input type="number" id="club_t_lv" value="3" min="1" max="5" placeholder="Niveau (1-5)">
+          <button class="btn btn-primary" id="clubAddBtn" onclick="clubAddTeam()" style="justify-content:center">➕ Inscrire l'équipe</button>
+        </div>
+        <div id="clubQuotaFullMsg" class="info info-y" style="display:none;margin-bottom:12px">Votre quota d'équipes est atteint. Contactez l'organisateur pour en ajouter.</div>
+        <div id="clubAddMsg" style="font-size:13px;min-height:18px;margin-bottom:10px"></div>
+        <div id="clubTeamsList"></div>
+        <div style="font-size:12px;color:var(--muted);margin-top:10px">Vos équipes sont intégrées au tournoi après validation par l'organisateur.</div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <div id="loginOverlay" class="login-overlay" style="display:none;">
@@ -3406,9 +4155,57 @@ body.tv-mode .app-msg-banner{ display:none!important; }
   </div>
 </div>
 
+<!-- ══ APERÇU D'IMPRESSION ══ -->
+<div id="printModal">
+  <div class="pm-box">
+    <div class="pm-bar"><div id="printTitle" style="font-family:'Oswald',sans-serif;font-size:16px;letter-spacing:1px">Aperçu</div>
+      <div style="display:flex;gap:8px"><button class="btn btn-primary btn-sm" onclick="printNow()">🖨️ Imprimer</button><button class="btn btn-ghost btn-sm" onclick="closePrint()">✕ Fermer</button></div></div>
+    <div id="printContent" class="pm-doc"></div>
+  </div>
+</div>
+
+<!-- ══ PAVÉ NUMÉRIQUE MOBILE (identique à l'appli RSTH) ══ -->
+<div id="numpadOverlay" style="display:none;position:fixed;inset:0;z-index:600;background:rgba(0,0,0,.6);backdrop-filter:blur(4px);align-items:flex-end;justify-content:center">
+  <div style="background:var(--s1);border:1px solid var(--bdr2);border-radius:18px 18px 0 0;padding:20px;width:100%;max-width:420px;box-shadow:0 -8px 32px rgba(0,0,0,.5)">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <div style="font-family:'Oswald',sans-serif;font-size:15px;letter-spacing:.8px;color:var(--ink2)" id="numpadLabel">Score</div>
+      <button onclick="closeNumpad()" style="background:none;border:none;color:var(--muted);font-size:22px;cursor:pointer;padding:4px 8px">✕</button>
+    </div>
+    <div style="display:flex;align-items:center;justify-content:center;gap:16px;margin-bottom:16px;background:var(--s2);border-radius:12px;padding:14px">
+      <div style="text-align:center"><div id="numpadTeamA" style="font-size:11px;color:var(--muted);margin-bottom:4px;max-width:120px"></div><div id="numpadValA" style="font-family:'Oswald',sans-serif;font-size:48px;color:var(--grn);min-width:60px;text-align:center">–</div></div>
+      <div style="font-family:'Oswald',sans-serif;font-size:24px;color:var(--dim)">VS</div>
+      <div style="text-align:center"><div id="numpadTeamB" style="font-size:11px;color:var(--muted);margin-bottom:4px;max-width:120px"></div><div id="numpadValB" style="font-family:'Oswald',sans-serif;font-size:48px;color:var(--grn);min-width:60px;text-align:center">–</div></div>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:12px">
+      <button id="numpadBtnA" onclick="numpadSelectTeam('A')">Score A</button>
+      <button id="numpadBtnB" onclick="numpadSelectTeam('B')">Score B</button>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
+      <button class="numpad-key" onclick="numpadPress(1)">1</button><button class="numpad-key" onclick="numpadPress(2)">2</button><button class="numpad-key" onclick="numpadPress(3)">3</button>
+      <button class="numpad-key" onclick="numpadPress(4)">4</button><button class="numpad-key" onclick="numpadPress(5)">5</button><button class="numpad-key" onclick="numpadPress(6)">6</button>
+      <button class="numpad-key" onclick="numpadPress(7)">7</button><button class="numpad-key" onclick="numpadPress(8)">8</button><button class="numpad-key" onclick="numpadPress(9)">9</button>
+      <button class="numpad-key numpad-del" onclick="numpadDel()">⌫</button><button class="numpad-key" onclick="numpadPress(0)">0</button><button class="numpad-key numpad-ok" onclick="numpadConfirm()">✓ OK</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ LIVE FERMÉ (spectateurs) ══ -->
+<div id="liveClosedOverlay" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(200,220,255,.9);backdrop-filter:blur(6px);align-items:center;justify-content:center;padding:20px">
+  <div class="panel" style="max-width:420px;width:100%;text-align:center;margin:0">
+    <div class="panel-body" style="padding:26px 22px">
+      <div style="font-size:44px">⏰</div>
+      <div style="font-family:'Oswald',sans-serif;font-size:21px;letter-spacing:1px;margin:6px 0 8px;color:var(--ink2)">Le live n'est pas encore ouvert</div>
+      <div style="font-size:14px;color:var(--ink);line-height:1.6;margin-bottom:16px">Les matchs, scores et classements seront visibles dès que l'organisateur ouvrira le live. Revenez un peu plus tard.</div>
+      <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
+        <button class="btn btn-ghost" onclick="liveClosedBack()">← Retour</button>
+        <button class="btn btn-primary" onclick="liveClosedRules()">📋 Règlement</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="floating-nav">
     <button class="float-btn" id="scrollTopBtn">⬆ Haut</button>
-    <button class="float-btn" id="printBtn" title="Imprimer">🖨️ Imprimer</button>
 </div>
 <div id="notice" class="notice"></div>
 
@@ -3529,8 +4326,18 @@ body.tv-mode .app-msg-banner{ display:none!important; }
   window.enterSpectator = function(target){
     window._specEntered = true;
     window.hideLoginScreen();
+    if(window.__liveBlocked && window.__liveBlocked()){ const o=document.getElementById('liveClosedOverlay'); if(o) o.style.display='flex'; return; }
     if(target==='TV'){ if(window.openTV) window.openTV(); }
     else if(target && window.switchTab) window.switchTab(target);
+  };
+
+  window.liveClosedBack = function(){
+    const o=document.getElementById('liveClosedOverlay'); if(o) o.style.display='none';
+    window._specEntered=false; window.showLoginScreen();
+  };
+  window.liveClosedRules = function(){
+    const o=document.getElementById('liveClosedOverlay'); if(o) o.style.display='none';
+    if(window.switchTab) window.switchTab('reglement');
   };
 
   // Tiroir mobile
