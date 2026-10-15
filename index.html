@@ -39,7 +39,7 @@
         let salleNames = ['Salle A']; // noms des salles
         let randomMode = true;
         let currentFormat = "E";
-        let timeSettings = { startP1:'09:00', durationP1:30, breakP1:5, lunchStart:'12:30', lunchDuration:90, durationP2:30, breakP2:5 };
+        let timeSettings = { startP1:'09:00', durationP1:30, breakP1:5, lunchStart:'12:30', lunchDuration:90, durationP2:30, breakP2:5, travelGap:20 };
         let isAdmin = false;
         let isSaisie = false;
         let USER_ROLES = [];                 // rôles du compte connecté (collection users, comme l'appli RSTH)
@@ -69,7 +69,7 @@
         function getScore(v){ let n=parseInt(v); return isNaN(n)?NaN:n; }
         function isPlayed(m){ let s1=getScore(m.score1), s2=getScore(m.score2); return !isNaN(s1) && !isNaN(s2); }
         function timeToMin(t){ let [h,m]=t.split(':').map(Number); return h*60+m; }
-        function minToTime(m){ let h=Math.floor(m/60)%24, mn=m%60; return String(h).padStart(2,'0')+':'+String(mn).padStart(2,'0'); }
+        function minToTime(m){ m=Math.max(0,Math.round(m)); let h=Math.floor(m/60), mn=m%60; return String(h).padStart(2,'0')+':'+String(mn).padStart(2,'0'); }   // au-delà de minuit : 24:05, 25:10…
         function shuffleArray(arr){ for(let i=arr.length-1;i>0;i--){let j=Math.floor(Math.random()*(i+1));[arr[i],arr[j]]=[arr[j],arr[i]];} return arr; }
         // Normalise un nom de club en retirant les chiffres et espaces superflus pour la comparaison
         function clubBaseName(club){ return (club||'').replace(/\d+/g,'').replace(/\s+/g,' ').trim().toLowerCase(); }
@@ -120,6 +120,7 @@
         }
 
         function readTimeSettings(){
+            { const tg=parseInt(document.getElementById('travelGap')?.value); timeSettings.travelGap=isNaN(tg)?20:Math.max(0,tg); }
             timeSettings.startP1=document.getElementById('startTimeP1')?.value||'09:00';
             timeSettings.durationP1=Math.max(10,parseInt(document.getElementById('durationP1')?.value)||30);
             timeSettings.breakP1=Math.max(0,parseInt(document.getElementById('breakP1')?.value)||0);
@@ -131,6 +132,7 @@
         }
 
         function applyTimeSettings(){
+            if(document.getElementById('travelGap')) document.getElementById('travelGap').value=(timeSettings.travelGap??20);
             if(document.getElementById('startTimeP1')) document.getElementById('startTimeP1').value=timeSettings.startP1;
             if(document.getElementById('durationP1')) document.getElementById('durationP1').value=timeSettings.durationP1;
             if(document.getElementById('breakP1')) document.getElementById('breakP1').value=timeSettings.breakP1;
@@ -797,7 +799,7 @@
 
             genMatchesFromGroupsE();
             renderPhase2UI(); renderSchedule(); updateCounters(); saveData(); updateTopRecap();
-            showMsg(`Phase 2 Format E : ${matchesP2.length} matchs générés`);
+            showMsg(`Phase 2 : ${matchesP2.length} matchs générés`);
         }
 
         // Poules de P2 flexibles : chaque poule prend 1 équipe dans chacune des 4 tranches du classement P1
@@ -1050,7 +1052,7 @@
         function renderFormatEGroupEditor(){
             if(!groupsP2E.length) return '';
             let conflicts=detectConflictsFormatE();
-            let html=`<div class="panel"><div class="panel-header" style="background:rgba(255,160,0,0.05);">⚙️ Composition des poules Phase 2 (Format E)
+            let html=`<div class="panel"><div class="panel-header" style="background:rgba(255,160,0,0.05);">⚙️ Composition des poules Phase 2
                 ${conflicts.length>0?`<span style="background:var(--warning);color:#2c2c1c;border-radius:20px;padding:2px 10px;font-size:0.65rem;">⚠️ ${conflicts.length} conflit(s) P1</span>`:'<span style="background:rgba(26,122,58,0.15);color:var(--accent);border-radius:20px;padding:2px 10px;font-size:0.65rem;">✅ Pas de conflits</span>'}
             </div><div class="panel-body">`;
             html+=`<p style="font-size:0.72rem;color:var(--text-muted);margin-bottom:12px;">Les équipes marquées ⚠️ étaient déjà ensemble en Phase 1. Vous pouvez échanger une équipe entre la poule 1 et la poule 2 d'une même catégorie.</p>`;
@@ -1106,7 +1108,7 @@
         // ============ MATCHS DE CLASSEMENT FINAUX ============
         function genMatchesFinales(){
             if(!isAdmin){ showMsg("🔒 Accès administrateur requis"); return; }
-            if(currentFormat!=='E'){ showMsg("⚠️ Les matchs de classement final sont uniquement disponibles en Format E"); return; }
+            if(currentFormat!=='E'){ showMsg("⚠️ Les matchs de classement ne sont pas disponibles avec ce format"); return; }
             if(!matchesP2.length){ showMsg("Générez Phase 2 d'abord"); return; }
 
             if(teams.length!==40){
@@ -1856,12 +1858,13 @@ window._smNav=function(idx){ _smSectionIdx=idx; renderScoreModal(); };
             scheduleGlobal(matchesP1,timeSettings.startP1,timeSettings.durationP1,timeSettings.breakP1);
             let p1End=0; matchesP1.forEach(m=>{ if(m.startTime) p1End=Math.max(p1End,timeToMin(m.startTime)+timeSettings.durationP1); });
             let lunchEnd=timeToMin(timeSettings.lunchStart)+timeSettings.lunchDuration;
-            let p2Start=Math.max(p1End,lunchEnd);
+            const travel=(nbSalles>1?(timeSettings.travelGap??20):0);
+            let p2Start=Math.max(p1End+travel,lunchEnd);
             timeSettings.startP2=minToTime(p2Start);
             scheduleGlobal(matchesP2,timeSettings.startP2,timeSettings.durationP2,timeSettings.breakP2);
             if(matchesFinales.length){
                 let p2End=0; matchesP2.forEach(m=>{ if(m.startTime) p2End=Math.max(p2End,timeToMin(m.startTime)+timeSettings.durationP2); });
-                let finStart=minToTime(Math.max(p2End,p2Start+60));
+                let finStart=minToTime(Math.max(p2End+travel,p2Start+60));
                 scheduleGlobal(matchesFinales,finStart,timeSettings.durationP2,timeSettings.breakP2);
             }
             saveData(); renderPhase1UI();
@@ -1871,7 +1874,8 @@ window._smNav=function(idx){ _smSectionIdx=idx; renderScoreModal(); };
             let msg=`✅ P1 ${timeSettings.startP1}→${minToTime(p1End)} · Déj. ${timeSettings.lunchStart} (${timeSettings.lunchDuration}min) · P2 dès ${timeSettings.startP2}`;
             const horairesInfo=document.getElementById('horairesInfo');
             if(horairesInfo){ horairesInfo.textContent=msg; horairesInfo.style.display='block'; }
-            showMsg('Horaires générés ✓'); updateTopRecap();
+            { const iss=validateSchedule(); renderScheduleCheck(); showMsg(iss.some(i=>i.level==='err')?'⚠️ Horaires générés, mais des conflits subsistent (voir Planning)':(iss.some(i=>i.text.indexOf('minuit')>=0)?'⚠️ Horaires générés : le planning dépasse minuit (voir Planning)':'Horaires générés ✓')); }
+            updateTopRecap();
         }
 
         // ============ PROGRAMME / PLANNING ============
@@ -2077,7 +2081,7 @@ window._smNav=function(idx){ _smSectionIdx=idx; renderScoreModal(); };
                     "Meilleur score cumulé des 2 premiers matchs de poule"
                 ]));
 
-            let b7 = fmt==='E' ? ruleBlock('🏆','Format E — Composition des poules P2',
+            let b7 = fmt==='E' ? ruleBlock('🏆','Composition des poules P2',
                 "Les 10 poules sont constituées d'après le classement général de la Phase 1 :<br>"+
                 '<div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 16px;margin-top:6px;font-size:0.72rem;">'+
                 '<span>🥇 Élite 1 : 1e, 8e, 4e, 6e</span><span>🥇 Élite 2 : 2e, 7e, 3e, 5e</span>'+
@@ -2129,12 +2133,13 @@ window._smNav=function(idx){ _smSectionIdx=idx; renderScoreModal(); };
 
         function saveData(){
             if(!isAdmin&&!isSaisie) return;
-            const data={teams,groupsP1,matchesP1,matchesP2,matchesFinales,groupsP2E,nbTerrains,nbSalles,terrainsParSalle,salleNames,randomMode,currentFormat,timeSettings};
+            const data={appKey:'flex',teams,groupsP1,matchesP1,matchesP2,matchesFinales,groupsP2E,nbTerrains,nbSalles,terrainsParSalle,salleNames,randomMode,currentFormat,timeSettings};
             if(saveTimeout) clearTimeout(saveTimeout);
             saveTimeout=setTimeout(()=>saveDataToFirebase(data),300);
         }
 
         function applyFirebaseData(d){
+            if(d&&d.appKey&&d.appKey!=='flex') showMsg('⚠️ Ce document appartient à une autre appli ('+d.appKey+') : vérifiez la base utilisée.');
             teams=d.teams||[]; const teamCountEl=document.getElementById('teamCount'); if(teamCountEl && [32,36,40,44,48].includes(teams.length)) teamCountEl.value=String(teams.length); groupsP1=d.groupsP1||[]; matchesP1=d.matchesP1||[]; matchesP2=d.matchesP2||[];
             matchesFinales=d.matchesFinales||[]; groupsP2E=d.groupsP2E||[];
             nbTerrains=d.nbTerrains||6; nbSalles=d.nbSalles||1;
@@ -3125,8 +3130,14 @@ window._smNav=function(idx){ _smSectionIdx=idx; renderScoreModal(); };
         });
         document.addEventListener('change',e=>{
             const el=e.target; if(!el.classList||!isAdmin) return;
-            if(el.classList.contains('bd-terrain')){ const m=bdFind(el.dataset.ph,el.dataset.id); if(m){ m.terrain=parseInt(el.value); saveData(); renderSchedule(); bdRerender(el.dataset.ph); } }
-            else if(el.classList.contains('bd-time')){ const m=bdFind(el.dataset.ph,el.dataset.id); if(m){ m.startTime=el.value; saveData(); renderSchedule(); bdRerender(el.dataset.ph); } }
+            if(el.classList.contains('bd-terrain')){ const m=bdFind(el.dataset.ph,el.dataset.id); if(m){
+                const c=chkConflictText(el.dataset.ph,m,m.startTime,parseInt(el.value));
+                if(c&&!confirm('⚠️ Conflit : '+c+'.\n\nAppliquer quand même ?')){ bdRerender(el.dataset.ph); return; }
+                m.terrain=parseInt(el.value); saveData(); renderSchedule(); bdRerender(el.dataset.ph); renderScheduleCheck(); } }
+            else if(el.classList.contains('bd-time')){ const m=bdFind(el.dataset.ph,el.dataset.id); if(m){
+                const c=chkConflictText(el.dataset.ph,m,el.value,m.terrain);
+                if(c&&!confirm('⚠️ Conflit : '+c+'.\n\nAppliquer quand même ?')){ bdRerender(el.dataset.ph); return; }
+                m.startTime=el.value; saveData(); renderSchedule(); bdRerender(el.dataset.ph); renderScheduleCheck(); } }
         });
 
         // ── Pavé numérique mobile ──
@@ -3204,6 +3215,75 @@ window._smNav=function(idx){ _smSectionIdx=idx; renderScoreModal(); };
                 LIVE_OPEN=nv; updateLiveUI(); showMsg(nv?'🟢 Live ouvert : les spectateurs voient le tournoi':'🔴 Live fermé : les spectateurs sont bloqués');
             }catch(e){ console.error(e); showMsg('⚠️ Impossible de changer le live : '+e.message); }
         };
+
+
+        // ============ CONTRÔLE DE COHÉRENCE DU PLANNING ============
+        const chkAll=()=>{ const L=[]; matchesP1.forEach(m=>L.push({ph:'P1',m,d:timeSettings.durationP1})); matchesP2.forEach(m=>L.push({ph:'P2',m,d:timeSettings.durationP2})); matchesFinales.forEach(m=>L.push({ph:'Classement',m,d:timeSettings.durationP2})); return L; };
+        const chkName=t=>{ if(!t) return '?'; const T=teams.find(x=>x.id===t.id)||t; return T.club||'?'; };
+        const chkSalle=m=>nbSalles>1&&m.terrain?getSalleForTerrain(+m.terrain):0;
+        function validateSchedule(){
+            const issues=[], all=chkAll(), timed=all.filter(x=>x.m.startTime&&!isNaN(timeToMin(x.m.startTime)));
+            const noTime=all.length-timed.length; if(all.length&&noTime) issues.push({level:'warn',text:`${noTime} match(s) sans horaire : générez les horaires.`});
+            const travel=nbSalles>1?(timeSettings.travelGap??20):0;
+            // équipe qui joue 2 fois en même temps / change de salle sans coupure
+            const byTeam={}; timed.forEach(x=>[x.m.team1,x.m.team2].forEach(t=>{ if(t) (byTeam[t.id]=byTeam[t.id]||[]).push(x); }));
+            Object.entries(byTeam).forEach(([tid,list])=>{
+                list.sort((a,b)=>timeToMin(a.m.startTime)-timeToMin(b.m.startTime));
+                for(let i=0;i<list.length;i++) for(let j=i+1;j<list.length;j++){
+                    const A=list[i],B=list[j], a0=timeToMin(A.m.startTime), b0=timeToMin(B.m.startTime);
+                    if(a0<b0+B.d&&b0<a0+A.d) issues.push({level:'err',text:`${chkName({id:+tid})} joue 2 matchs en même temps : ${A.ph} ${A.m.startTime} (terrain ${A.m.terrain}) et ${B.ph} ${B.m.startTime} (terrain ${B.m.terrain}).`});
+                }
+                for(let i=1;i<list.length;i++){
+                    const P=list[i-1],C=list[i];
+                    if(chkSalle(P.m)!==chkSalle(C.m)){
+                        const gap=timeToMin(C.m.startTime)-(timeToMin(P.m.startTime)+P.d);
+                        if(gap>=0&&gap<travel){ issues.push({level:'warn',text:`${chkName({id:+tid})} change de salle sans coupure suffisante (${P.m.startTime} terrain ${P.m.terrain} → ${C.m.startTime} terrain ${C.m.terrain}, ${gap} min).`}); }
+                    }
+                }
+            });
+            // terrain utilisé par 2 matchs en même temps
+            const tk={}; timed.forEach(x=>{ (tk[x.m.terrain]=tk[x.m.terrain]||[]).push(x); });
+            Object.entries(tk).forEach(([ter,list])=>{ for(let i=0;i<list.length;i++) for(let j=i+1;j<list.length;j++){ const A=list[i],B=list[j], a0=timeToMin(A.m.startTime), b0=timeToMin(B.m.startTime); if(a0<b0+B.d&&b0<a0+A.d) issues.push({level:'err',text:`Terrain ${ter} utilisé par 2 matchs en même temps : ${A.ph} ${A.m.startTime} et ${B.ph} ${B.m.startTime}.`}); } });
+            // poules : une équipe dans une seule poule, bon nombre de matchs
+            [['P1',groupsP1,matchesP1],['P2',groupsP2E,matchesP2]].forEach(([ph,groups,ms])=>{
+                if(!ms.length||!groups.length) return;
+                const inPool={}; groups.forEach(g=>g.teams.forEach(t=>{ (inPool[t.id]=inPool[t.id]||[]).push(g.name); }));
+                Object.entries(inPool).forEach(([id,gs])=>{ if(gs.length>1) issues.push({level:'err',text:`${chkName({id:+id})} est dans ${gs.length} poules en ${ph} (${gs.join(', ')}).`}); });
+                const cnt={}; ms.forEach(m=>[m.team1,m.team2].forEach(t=>{ if(t) cnt[t.id]=(cnt[t.id]||0)+1; }));
+                groups.forEach(g=>g.teams.forEach(t=>{ const exp=g.teams.length-1, got=cnt[t.id]||0; if(got!==exp) issues.push({level:'err',text:`${chkName(t)} a ${got} match(s) en ${ph} au lieu de ${exp}.`}); }));
+            });
+            // enchaînement des phases
+            const endOf=(L)=>L.length?Math.max(...L.map(x=>timeToMin(x.m.startTime)+x.d)):0, startOf=(L)=>L.length?Math.min(...L.map(x=>timeToMin(x.m.startTime))):0;
+            const p1=timed.filter(x=>x.ph==='P1'), p2=timed.filter(x=>x.ph==='P2'), fn=timed.filter(x=>x.ph==='Classement');
+            if(p1.length&&p2.length&&startOf(p2)<endOf(p1)) issues.push({level:'err',text:`La Phase 2 commence (${minToTime(startOf(p2))}) avant la fin de la Phase 1 (${minToTime(endOf(p1))}).`});
+            if(p2.length&&fn.length&&startOf(fn)<endOf(p2)) issues.push({level:'err',text:`Les matchs de classement commencent (${minToTime(startOf(fn))}) avant la fin de la Phase 2 (${minToTime(endOf(p2))}).`});
+            const last=timed.length?endOf(timed):0;
+            if(last>1440) issues.push({level:'warn',text:`Le planning dépasse minuit (fin à ${minToTime(last)}). Ajoutez des terrains, raccourcissez les matchs ou les transitions.`});
+            return issues;
+        }
+        function renderScheduleCheck(){
+            const el=document.getElementById('scheduleCheck'); if(!el) return;
+            if(!matchesP1.length){ el.innerHTML=''; return; }
+            const issues=validateSchedule(), errs=issues.filter(i=>i.level==='err'), warns=issues.filter(i=>i.level==='warn');
+            if(!issues.length){ el.innerHTML='<div class="info info-g">✅ Planning cohérent : aucune équipe n\'a deux matchs en même temps, aucun terrain n\'est en double, les phases s\'enchaînent.</div>'; return; }
+            const li=issues.slice(0,25).map(i=>`<li style="margin:2px 0">${i.level==='err'?'⛔':'⚠️'} ${esc(i.text)}</li>`).join('');
+            el.innerHTML=`<div class="info ${errs.length?'info-y':'info-b'}"><b>${errs.length} conflit(s) · ${warns.length} avertissement(s)</b><ul style="margin:6px 0 0 18px;padding:0">${li}</ul>${issues.length>25?`<div style="margin-top:4px">… et ${issues.length-25} autre(s)</div>`:''}<div style="margin-top:6px;font-size:12px">Utilisez « Générer horaires » pour recalculer un planning cohérent (cela écrase les horaires modifiés à la main).</div></div>`;
+        }
+        setInterval(()=>{ const t=document.getElementById('planningTab'); if(t&&t.classList.contains('active')) renderScheduleCheck(); },2000);
+        window.renderScheduleCheck=renderScheduleCheck;
+        function chkConflictText(ph,m,newTime,newTerrain){
+            const dur=ph==='P1'?timeSettings.durationP1:timeSettings.durationP2, t0=timeToMin(newTime||'');
+            if(isNaN(t0)) return '';
+            const mine=[m.team1&&m.team1.id,m.team2&&m.team2.id], out=[];
+            chkAll().forEach(x=>{
+                if(x.m===m||!x.m.startTime) return;
+                const s0=timeToMin(x.m.startTime); if(isNaN(s0)||!(t0<s0+x.d&&s0<t0+dur)) return;
+                const shared=[x.m.team1,x.m.team2].filter(t=>t&&mine.includes(t.id));
+                if(shared.length) out.push(`${chkName(shared[0])} joue déjà à ${x.m.startTime} (${x.ph}, terrain ${x.m.terrain})`);
+                if(+x.m.terrain===+newTerrain) out.push(`le terrain ${x.m.terrain} est déjà utilisé à ${x.m.startTime}`);
+            });
+            return out.join(' ; ');
+        }
 
         // Exposer
         window.switchTab=function(tabId){ document.querySelectorAll('.tab').forEach(btn=>{ if(btn.dataset.tab===tabId) btn.click(); }); };
@@ -3854,13 +3934,13 @@ body.tv-mode .app-msg-banner{ display:none!important; }
                 <div class="config-group">
                     <span class="config-label">Nombre d'équipes :</span>
                     <label><select id="teamCount" style="padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:var(--surface2);color:var(--text);font-family:'Exo 2',sans-serif;font-size:0.82rem;width:auto;">
-                        <option value="32">32 équipes — 8 poules</option><option value="36">36 équipes — 9 poules</option><option value="40" selected>40 équipes — 10 poules (Format E original)</option><option value="44">44 équipes — 11 poules</option><option value="48">48 équipes — 12 poules</option>
+                        <option value="32">32 équipes — 8 poules</option><option value="36">36 équipes — 9 poules</option><option value="40" selected>40 équipes — 10 poules</option><option value="44">44 équipes — 11 poules</option><option value="48">48 équipes — 12 poules</option>
                     </select></label>
                     <span style="font-size:.75rem;color:var(--text-muted);">Seuls les multiples de 4 de 32 à 48 sont autorisés.</span>
                 </div>
                 <div class="config-group">
                     <span class="config-label">Format :</span>
-                    <div class="format-options"><label class="format-option"><input type="radio" name="format" value="E" checked> Format E : P1 en poules de 4, P2 par niveaux et classement final</label></div>
+                    <div class="format-options"><label class="format-option"><input type="radio" name="format" value="E" checked> P1 en poules de 4, P2 par niveaux et classement final</label></div>
                 </div>
                 <div class="config-group">
                     <span class="config-label">Salles :</span>
@@ -3897,6 +3977,11 @@ body.tv-mode .app-msg-banner{ display:none!important; }
                     <span class="config-label">Phase 2 :</span>
                     <label>Durée <input type="number" id="durationP2" value="30" style="width:58px;"> min</label>
                     <label>Transition <input type="number" id="breakP2" value="5" style="width:50px;"> min</label>
+                </div>
+                <div class="config-group">
+                    <span class="config-label">Entre les salles :</span>
+                    <label>Coupure de déplacement <input type="number" id="travelGap" value="20" style="width:58px;"> min</label>
+                    <span style="font-size:12px;color:var(--muted)">Imposée entre la fin d'une phase et le début de la suivante quand il y a 2 salles.</span>
                 </div>
             </div>
         </div>
@@ -3965,6 +4050,7 @@ body.tv-mode .app-msg-banner{ display:none!important; }
                 </div>
                 <div style="font-size:12px;color:var(--muted);margin-top:8px">1) Générez les matchs de poule · 2) Générez les horaires avec les durées réglées à l'étape Config.</div>
                 <div id="horairesInfo" style="font-size:12px;color:var(--grn);padding:6px 0 0;display:none;"></div>
+                <div id="scheduleCheck" style="margin-top:10px"></div>
             </div>
         </div>
         <div class="panel print-bar"><div class="panel-body" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px 16px"><span class="pb-ttl">🖨️ Imprimer</span><button class="btn btn-ghost btn-sm pb-btn" onclick="printProgram('P1')">📋 Programme P1</button><button class="btn btn-ghost btn-sm pb-btn" onclick="printTeamSlips('P1')">🗂️ Toutes les fiches P1</button><select id="printTeamSel" style="padding:6px 8px;border-radius:8px;max-width:210px"></select><button class="btn btn-ghost btn-sm pb-btn" onclick="printOneSlip()">🖨️ Fiche de cette équipe</button></div></div>
@@ -3978,7 +4064,7 @@ body.tv-mode .app-msg-banner{ display:none!important; }
             <div class="panel-header">📡 Live spectateurs</div>
             <div class="panel-body">
                 <div class="step-actions"><button class="btn btn-ghost live-toggle" onclick="toggleLiveOpen()">🔴 Live fermé</button></div>
-                <div style="font-size:12px;color:var(--muted);margin-top:8px">Tant que le live est fermé, les spectateurs voient un écran d'attente et ne peuvent pas lire le tournoi. Le staff (admin, scorer) voit toujours tout. Ouvrez le live quand les équipes et le planning sont prêts.</div>
+                <div style="font-size:12px;color:var(--muted);margin-top:8px">Tant que le live est fermé, les spectateurs voient un écran d'attente et ne peuvent pas lire le tournoi. Le staff (admin, scorer) voit toujours tout. Ouvrez le live quand les équipes et le planning sont prêts.<br>Base de données de cette appli : <b>flex/current</b> — elle est séparée de l'appli RSTH interclubs (<b>interclub/current</b>) ; seuls les comptes (<b>users</b>) sont communs.</div>
             </div>
         </div>
         <div class="panel">
