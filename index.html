@@ -312,8 +312,16 @@
             return Array.from({length:nbGroups},(_,i)=>({name:groupNames[i],teams:sorted.slice(i*teamsPerGroup,(i+1)*teamsPerGroup)}));
         }
 
+        // Garde-fou : régénérer efface les scores déjà saisis (tout est dans un seul document).
+        function _countScores(lists){ return lists.reduce((n,l)=>n+(l||[]).filter(isPlayed).length,0); }
+        function confirmEraseScores(lists,what){
+            const n=_countScores(lists);
+            if(!n) return true;
+            return confirm('⚠️ '+n+' score(s) déjà saisi(s).\n'+what+' va EFFACER ces scores. Continuer ?') && confirm('Dernière confirmation : effacer les scores ?');
+        }
         function doTirage(){
             if(!isAdmin){ showMsg("🔒 Seul l'administrateur peut faire le tirage"); return; }
+            if(!confirmEraseScores([matchesP1,matchesP2,matchesFinales],'Refaire le tirage')) return;
             let nbGroups=teams.length/4;
             let teamsPerGroup=4;
             if(randomMode) groupsP1=drawGroupsAvoidSameClub(nbGroups,teamsPerGroup);
@@ -380,6 +388,7 @@
         function genPhase1(){
             if(!isAdmin){ showMsg("🔒 Seul l'administrateur peut générer les matchs"); return; }
             if(!groupsP1.length){ showMsg("D'abord faire le tirage P1"); return; }
+            if(!confirmEraseScores([matchesP1,matchesP2,matchesFinales],'Régénérer la Phase 1')) return;
             matchesP1=[]; matchesP2=[]; matchesFinales=[]; groupsP2E=[];
             let nextId=1;
             for(let idx=0;idx<groupsP1.length;idx++){
@@ -732,6 +741,7 @@
 
         function genPhase2(){
             if(!isAdmin){ showMsg("🔒 Seul l'administrateur peut générer la Phase 2"); return; }
+            if(!confirmEraseScores([matchesP2,matchesFinales],'Régénérer la Phase 2')) return;
             if(currentFormat==="E"){ genPhase2FormatE(); return; }
             if(!groupsP1.length||!matchesP1.length){ showMsg("Générez Phase 1 d'abord"); return; }
             let all=getAllTeamsRankedP1();
